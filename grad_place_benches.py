@@ -40,6 +40,50 @@ def extract_nets(plc, benchmark):
                 nets.append(list(members))
     return nets
 
+def compute_density_grid_fast(placement, benchmark):
+    num_macros = benchmark.num_hard_macros + benchmark.num_soft_macros
+    sizes = benchmark.macro_sizes[:num_macros]
+    grid_rows = benchmark.grid_rows
+    grid_cols = benchmark.grid_cols
+    bin_w = benchmark.canvas_width / grid_cols
+    bin_h = benchmark.canvas_height / grid_rows
+
+    # Macro edges
+    cx = placement[:num_macros, 0]
+    cy = placement[:num_macros, 1]
+    half_w = sizes[:, 0] / 2
+    half_h = sizes[:, 1] / 2
+    left = cx - half_w
+    right = cx + half_w
+    bottom = cy - half_h
+    top = cy + half_h
+
+    # Bin edges
+    bin_left = torch.arange(grid_cols, dtype=torch.float32) * bin_w
+    bin_right = bin_left + bin_w
+    bin_bottom = torch.arange(grid_rows, dtype=torch.float32) * bin_h
+    bin_top = bin_bottom + bin_h
+
+    # Overlap in x: (num_macros, grid_cols)
+    overlap_x = torch.clamp(
+        torch.min(right.unsqueeze(1), bin_right.unsqueeze(0)) -
+        torch.max(left.unsqueeze(1), bin_left.unsqueeze(0)),
+        min=0
+    )
+
+    # Overlap in y: (num_macros, grid_rows)
+    overlap_y = torch.clamp(
+        torch.min(top.unsqueeze(1), bin_top.unsqueeze(0)) -
+        torch.max(bottom.unsqueeze(1), bin_bottom.unsqueeze(0)),
+        min=0
+    )
+
+    # Density grid: (grid_rows, grid_cols) = sum of overlap areas
+    # overlap_area[macro, row, col] = overlap_y[macro, row] * overlap_x[macro, col]
+    # Sum over macros: density[row, col] = sum_macro overlap_y[:,row].T @ overlap_x[:,col]
+    density = torch.mm(overlap_y.t(), overlap_x) / (bin_w * bin_h)
+
+    return density
 
 def compute_density_grid(placement, benchmark):
     num_macros = benchmark.num_hard_macros + benchmark.num_soft_macros
@@ -253,8 +297,8 @@ def run_placer(benchmark_name, num_steps=1500, lr=1.0, momentum=0.9, seed=42):
     benchmark, plc = load_benchmark_from_dir(
         f"external/MacroPlacement/Testcases/ICCAD04/{benchmark_name}"
     )
-
     nets = extract_nets(plc, benchmark)
+
     net_indices, net_mask = precompute_net_tensors(nets)
     num_hard = benchmark.num_hard_macros
     sizes = benchmark.macro_sizes[:num_hard]
@@ -278,26 +322,38 @@ def run_placer(benchmark_name, num_steps=1500, lr=1.0, momentum=0.9, seed=42):
     start = time.time()
 
     net_weights = None
-    for step in range(num_steps):
+    for step in range(2000):
         # Update net weights every 100 steps
         if step % 100 == 0:
+            # t0=time.time()
             _set_placement(plc, placement.detach(), benchmark)
             plc.FLAG_UPDATE_WIRELENGTH = False
             net_weights = compute_net_weights(placement.detach(), nets, benchmark, plc)
-
+            # print("  {} step {}: computed net weights in {:.1f}ms".format(benchmark_name, step, (time.time() - t0) * 1000))
+        
         placement.requires_grad_(True)
+        # t0=time.time()
         wl = differentiable_wirelength(
             placement, nets, benchmark, net_indices=net_indices, net_mask=net_mask
         )
+        # print("  {} step {}: computed wirelength in {:.1f}ms".format(benchmark_name, step, (time.time() - t0) * 1000))
 
+        # t0=time.time()
         wl.backward()
         wl_grad = placement.grad[:num_hard].detach().clone()
+        # print("  {} step {}: computed wirelength gradient in {:.1f}ms".format(benchmark_name, step, (time.time() - t0) * 1000))
         placement.requires_grad_(False)
 
-        grid = compute_density_grid(placement, benchmark)
+        # t0=time.time()
+        grid =  compute_density_grid_fast(placement, benchmark)
+        # print("  {} step {}: computed density grid in {:.1f}ms".format(benchmark_name, step, (time.time() - t0) * 1000))
+        # t0=time.time()  
         potential = solve_poisson(grid, benchmark)
+        # print("  {} step {}: solved Poisson in {:.1f}ms".format(benchmark_name, step, (time.time() - t0) * 1000))
+        # t0=time.time()
         density_forces = compute_density_force(potential, placement, benchmark)
-
+        # print("  {} step {}: computed density forces in {:.1f}ms".format(benchmark_name, step, (time.time() - t0) * 1000))
+        
         total_grad = wl_grad - den_weight * density_forces
         if benchmark.macro_fixed.any():
             total_grad[benchmark.macro_fixed[:num_hard]] = 0.0
@@ -309,11 +365,12 @@ def run_placer(benchmark_name, num_steps=1500, lr=1.0, momentum=0.9, seed=42):
         hh = sizes[:, 1] / 2
         placement[:num_hard, 0].clamp_(min=hw, max=benchmark.canvas_width - hw)
         placement[:num_hard, 1].clamp_(min=hh, max=benchmark.canvas_height - hh)
+        
         if benchmark.macro_fixed.any():
             placement[benchmark.macro_fixed] = benchmark.macro_positions[benchmark.macro_fixed]
 
         if step % 10 == 0 and step > 0:
-            grid = compute_density_grid(placement, benchmark)
+            grid =  compute_density_grid_fast(placement, benchmark)
             overflow = (grid - grid.mean()).clamp(min=0).sum().item()
             if overflow > 0.1:
                 den_weight = min(0.5, den_weight * 1.1)
