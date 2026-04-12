@@ -1,3 +1,4 @@
+import traceback
 import random
 import time
 import sys
@@ -14,9 +15,7 @@ from gradient_place import (
     differentiable_overlap_penalty,
 )
 
-benchmark, plc = load_benchmark_from_dir("external/MacroPlacement/Testcases/ICCAD04/ibm01")
-
-
+BENCH_CACHE = {}
 def extract_nets(plc, benchmark):
     name_to_idx = {}
     for ti, pi in enumerate(benchmark.hard_macro_indices):
@@ -39,6 +38,7 @@ def extract_nets(plc, benchmark):
                 seen.add(key)
                 nets.append(list(members))
     return nets
+
 
 def compute_density_grid_fast(placement, benchmark):
     num_macros = benchmark.num_hard_macros + benchmark.num_soft_macros
@@ -66,16 +66,16 @@ def compute_density_grid_fast(placement, benchmark):
 
     # Overlap in x: (num_macros, grid_cols)
     overlap_x = torch.clamp(
-        torch.min(right.unsqueeze(1), bin_right.unsqueeze(0)) -
-        torch.max(left.unsqueeze(1), bin_left.unsqueeze(0)),
-        min=0
+        torch.min(right.unsqueeze(1), bin_right.unsqueeze(0))
+        - torch.max(left.unsqueeze(1), bin_left.unsqueeze(0)),
+        min=0,
     )
 
     # Overlap in y: (num_macros, grid_rows)
     overlap_y = torch.clamp(
-        torch.min(top.unsqueeze(1), bin_top.unsqueeze(0)) -
-        torch.max(bottom.unsqueeze(1), bin_bottom.unsqueeze(0)),
-        min=0
+        torch.min(top.unsqueeze(1), bin_top.unsqueeze(0))
+        - torch.max(bottom.unsqueeze(1), bin_bottom.unsqueeze(0)),
+        min=0,
     )
 
     # Density grid: (grid_rows, grid_cols) = sum of overlap areas
@@ -84,6 +84,7 @@ def compute_density_grid_fast(placement, benchmark):
     density = torch.mm(overlap_y.t(), overlap_x) / (bin_w * bin_h)
 
     return density
+
 
 def compute_density_grid(placement, benchmark):
     num_macros = benchmark.num_hard_macros + benchmark.num_soft_macros
@@ -209,28 +210,29 @@ def optimize_soft_macros(placement, nets, benchmark):
 
     return placement
 
+
 def legalize_fast(placement, benchmark, gap=0.01, max_iters=500):
     placement = placement.clone()
     num_hard = benchmark.num_hard_macros
     sizes = benchmark.macro_sizes[:num_hard]
     half_w = sizes[:, 0] / 2
     half_h = sizes[:, 1] / 2
-    
+
     sep_x = (sizes[:, 0].unsqueeze(1) + sizes[:, 0].unsqueeze(0)) / 2 + gap
     sep_y = (sizes[:, 1].unsqueeze(1) + sizes[:, 1].unsqueeze(0)) / 2 + gap
     tri = torch.triu(torch.ones(num_hard, num_hard, dtype=torch.bool), diagonal=1)
-    
+
     for iteration in range(max_iters):
         pos = placement[:num_hard]
         dx = pos[:, 0].unsqueeze(1) - pos[:, 0].unsqueeze(0)
         dy = pos[:, 1].unsqueeze(1) - pos[:, 1].unsqueeze(0)
         abs_dx = torch.abs(dx)
         abs_dy = torch.abs(dy)
-        
+
         overlap_mask = (abs_dx < sep_x) & (abs_dy < sep_y) & tri
         if not overlap_mask.any():
             break
-        
+
         # Process overlapping pairs only
         pairs = overlap_mask.nonzero()
         for p in range(pairs.shape[0]):
@@ -239,7 +241,7 @@ def legalize_fast(placement, benchmark, gap=0.01, max_iters=500):
             dy_val = placement[i, 1] - placement[j, 1]
             sx = sep_x[i, j].item()
             sy = sep_y[i, j].item()
-            
+
             if abs(dx_val) < sx and abs(dy_val) < sy:
                 if abs(dx_val) / sx > abs(dy_val) / sy:
                     push = (sx - abs(dx_val)) / 2 + gap
@@ -251,30 +253,32 @@ def legalize_fast(placement, benchmark, gap=0.01, max_iters=500):
                     sign = 1.0 if dy_val >= 0 else -1.0
                     placement[i, 1] += push * sign
                     placement[j, 1] -= push * sign
-        
+
         placement[:num_hard, 0].clamp_(min=half_w, max=benchmark.canvas_width - half_w)
         placement[:num_hard, 1].clamp_(min=half_h, max=benchmark.canvas_height - half_h)
-    
+
     return placement
+
 
 def compute_net_weights(placement, nets, benchmark, plc):
     from macro_place.objective import _set_placement
+
     _set_placement(plc, placement, benchmark)
     plc.FLAG_UPDATE_WIRELENGTH = False
-    
+
     h_cong = plc.get_horizontal_routing_congestion()
     v_cong = plc.get_vertical_routing_congestion()
-    
+
     rows, cols = benchmark.grid_rows, benchmark.grid_cols
     h_grid = torch.tensor(h_cong, dtype=torch.float32).reshape(rows, cols)
     v_grid = torch.tensor(v_cong, dtype=torch.float32).reshape(rows, cols)
     cong_grid = (h_grid + v_grid) / 2
-    
+
     bin_w = benchmark.canvas_width / cols
     bin_h = benchmark.canvas_height / rows
-    
+
     weights = torch.ones(len(nets))
-    
+
     for i, net in enumerate(nets):
         xs = [placement[m, 0].item() for m in net]
         ys = [placement[m, 1].item() for m in net]
@@ -282,21 +286,149 @@ def compute_net_weights(placement, nets, benchmark, plc):
         max_c = min(cols - 1, int(max(xs) / bin_w))
         min_r = max(0, int(min(ys) / bin_h))
         max_r = min(rows - 1, int(max(ys) / bin_h))
-        
-        region = cong_grid[min_r:max_r+1, min_c:max_c+1]
+
+        region = cong_grid[min_r : max_r + 1, min_c : max_c + 1]
         if region.numel() > 0:
             avg_cong = region.mean().item()
             weights[i] = 1.0 + max(0, avg_cong - 0.5) * 2.0
-    
+
     return weights
+
+
+def reduce_congestion(placement, benchmark, plc, nets, num_iterations=500):
+    """Move macros out of congested cells using TILOS-guided local search."""
+    print("Reducing congestion with local search...")
+    num_hard = benchmark.num_hard_macros
+    sizes = benchmark.macro_sizes[:num_hard]
+    rows, cols = benchmark.grid_rows, benchmark.grid_cols
+    bin_w = benchmark.canvas_width / cols
+    bin_h = benchmark.canvas_height / rows
+
+    _set_placement(plc, placement, benchmark)
+    plc.FLAG_UPDATE_WIRELENGTH = False
+    best_cong = plc.get_congestion_cost()
+    best_den = plc.get_density_cost()
+    best_score = 0.5 * best_den + 0.5 * best_cong
+
+    for iteration in range(num_iterations):
+        # Find most congested cells
+        h_cong = plc.get_horizontal_routing_congestion()
+        v_cong = plc.get_vertical_routing_congestion()
+        cong_grid = torch.tensor([(h + v) / 2 for h, v in zip(h_cong, v_cong)]).reshape(rows, cols)
+
+        # Find macros in congested cells
+        macro_cong = torch.zeros(num_hard)
+        for i in range(num_hard):
+            c = min(cols - 1, max(0, int(placement[i, 0].item() / bin_w)))
+            r = min(rows - 1, max(0, int(placement[i, 1].item() / bin_h)))
+            macro_cong[i] = cong_grid[r, c]
+
+        # Pick a macro from the top 20% most congested
+        top_k = max(1, num_hard // 5)
+        _, worst_indices = torch.topk(macro_cong, top_k)
+        idx = worst_indices[random.randint(0, top_k - 1)].item()
+
+        if benchmark.macro_fixed[idx]:
+            continue
+
+        # Try moving it slightly
+        old_x, old_y = placement[idx, 0].item(), placement[idx, 1].item()
+        shift = max(sizes[idx, 0].item(), sizes[idx, 1].item()) * 0.3
+        new_x = old_x + random.gauss(0, shift)
+        new_y = old_y + random.gauss(0, shift)
+        new_x = max(
+            sizes[idx, 0].item() / 2, min(benchmark.canvas_width - sizes[idx, 0].item() / 2, new_x)
+        )
+        new_y = max(
+            sizes[idx, 1].item() / 2, min(benchmark.canvas_height - sizes[idx, 1].item() / 2, new_y)
+        )
+
+        # Quick overlap check
+        has_overlap = False
+        for j in range(num_hard):
+            if j == idx:
+                continue
+            if (
+                abs(new_x - placement[j, 0].item())
+                < (sizes[idx, 0] + sizes[j, 0]).item() / 2 + 0.01
+                and abs(new_y - placement[j, 1].item())
+                < (sizes[idx, 1] + sizes[j, 1]).item() / 2 + 0.01
+            ):
+                has_overlap = True
+                break
+        if has_overlap:
+            continue
+
+        # Evaluate
+        placement[idx, 0] = new_x
+        placement[idx, 1] = new_y
+        _set_placement(plc, placement, benchmark)
+        plc.FLAG_UPDATE_WIRELENGTH = False
+        new_den = plc.get_density_cost()
+        new_cong = plc.get_congestion_cost()
+        new_score = 0.5 * new_den + 0.5 * new_cong
+
+        if new_score < best_score:
+            best_score = new_score
+            best_den = new_den
+            best_cong = new_cong
+        else:
+            placement[idx, 0] = old_x
+            placement[idx, 1] = old_y
+
+    return placement
+
+
+def run_placer_multiseed(
+    benchmark_name, num_steps=2000, lr=1.0, momentum=0.9, seeds=[42, 123, 456, 789, 1337, 2024, 4200, 2025, 31415, 27182]
+):
+    best_costs = None
+    best_legal = None
+    best_pc = float("inf")
+
+    for seed in seeds:
+        try:
+            costs, legal = run_placer(benchmark_name, num_steps=num_steps, lr=lr, momentum=momentum, seed=seed)
+            pc = costs.get('proxy_cost', float('inf'))
+            overlaps = costs.get('overlap_count', 999)
+            print(f"  {benchmark_name} seed={seed}: pc={pc:.4f} ovlp={overlaps}", flush=True)
+            
+            # Simple: prefer zero overlaps, then lowest proxy cost
+            better = False
+            if best_costs is None:
+                better = True
+            elif overlaps == 0 and best_costs.get('overlap_count', 999) > 0:
+                better = True
+            elif overlaps == 0 and best_costs.get('overlap_count', 999) == 0 and pc < best_pc:
+                better = True
+            elif overlaps > 0 and best_costs.get('overlap_count', 999) > 0 and pc < best_pc:
+                better = True
+            
+            if better:
+                best_pc = pc
+                best_costs = costs
+                best_legal = legal
+        except Exception as e:
+            print(f"  {benchmark_name} seed={seed} FAILED: {e}", flush=True)
+
+    print(
+        f"  {benchmark_name} BEST: pc={best_pc:.4f} ovlp={best_costs.get('overlap_count', '?')}",
+        flush=True,
+    )
+    return best_costs, best_legal
+
 
 def run_placer(benchmark_name, num_steps=1500, lr=1.0, momentum=0.9, seed=42):
     random.seed(seed)
     torch.manual_seed(seed)
 
-    benchmark, plc = load_benchmark_from_dir(
-        f"external/MacroPlacement/Testcases/ICCAD04/{benchmark_name}"
-    )
+    if not BENCH_CACHE.get(benchmark_name):
+        benchmark, plc = load_benchmark_from_dir(
+            f"external/MacroPlacement/Testcases/ICCAD04/{benchmark_name}"
+        )
+        BENCH_CACHE[benchmark_name] = (benchmark, plc)
+    else:
+        benchmark, plc = BENCH_CACHE[benchmark_name]
     nets = extract_nets(plc, benchmark)
 
     net_indices, net_mask = precompute_net_tensors(nets)
@@ -322,15 +454,17 @@ def run_placer(benchmark_name, num_steps=1500, lr=1.0, momentum=0.9, seed=42):
     start = time.time()
 
     net_weights = None
-    for step in range(2000):
+    for step in range(1500):
         # Update net weights every 100 steps
-        if step % 100 == 0:
+        if step % 100 == 0 and step > 0:
             # t0=time.time()
+            # with torch.no_grad():
+            # placement.data = optimize_soft_macros(placement.detach(), nets, benchmark).data
             _set_placement(plc, placement.detach(), benchmark)
             plc.FLAG_UPDATE_WIRELENGTH = False
             net_weights = compute_net_weights(placement.detach(), nets, benchmark, plc)
             # print("  {} step {}: computed net weights in {:.1f}ms".format(benchmark_name, step, (time.time() - t0) * 1000))
-        
+
         placement.requires_grad_(True)
         # t0=time.time()
         wl = differentiable_wirelength(
@@ -345,15 +479,16 @@ def run_placer(benchmark_name, num_steps=1500, lr=1.0, momentum=0.9, seed=42):
         placement.requires_grad_(False)
 
         # t0=time.time()
-        grid =  compute_density_grid_fast(placement, benchmark)
+        # grid = compute_density_grid_fast(placement, benchmark)
+        grid = compute_density_grid_fast(placement, benchmark)
         # print("  {} step {}: computed density grid in {:.1f}ms".format(benchmark_name, step, (time.time() - t0) * 1000))
-        # t0=time.time()  
+        # t0=time.time()
         potential = solve_poisson(grid, benchmark)
         # print("  {} step {}: solved Poisson in {:.1f}ms".format(benchmark_name, step, (time.time() - t0) * 1000))
         # t0=time.time()
         density_forces = compute_density_force(potential, placement, benchmark)
         # print("  {} step {}: computed density forces in {:.1f}ms".format(benchmark_name, step, (time.time() - t0) * 1000))
-        
+
         total_grad = wl_grad - den_weight * density_forces
         if benchmark.macro_fixed.any():
             total_grad[benchmark.macro_fixed[:num_hard]] = 0.0
@@ -365,12 +500,12 @@ def run_placer(benchmark_name, num_steps=1500, lr=1.0, momentum=0.9, seed=42):
         hh = sizes[:, 1] / 2
         placement[:num_hard, 0].clamp_(min=hw, max=benchmark.canvas_width - hw)
         placement[:num_hard, 1].clamp_(min=hh, max=benchmark.canvas_height - hh)
-        
+
         if benchmark.macro_fixed.any():
             placement[benchmark.macro_fixed] = benchmark.macro_positions[benchmark.macro_fixed]
 
         if step % 10 == 0 and step > 0:
-            grid =  compute_density_grid_fast(placement, benchmark)
+            grid = compute_density_grid_fast(placement, benchmark)
             overflow = (grid - grid.mean()).clamp(min=0).sum().item()
             if overflow > 0.1:
                 den_weight = min(0.5, den_weight * 1.1)
@@ -382,20 +517,23 @@ def run_placer(benchmark_name, num_steps=1500, lr=1.0, momentum=0.9, seed=42):
             cong = plc.get_congestion_cost()
             wl_val = wl.item()  # already computed this step
             proxy_est = wl_val + 0.5 * den + 0.5 * cong
-            
+
             # Count overlaps fast
             with torch.no_grad():
                 p = placement[:num_hard].detach()
-                dx = torch.abs(p.unsqueeze(0)[:,:,0] - p.unsqueeze(1)[:,:,0])
-                dy = torch.abs(p.unsqueeze(0)[:,:,1] - p.unsqueeze(1)[:,:,1])
-                sx = (sizes[:,0].unsqueeze(0) + sizes[:,0].unsqueeze(1)) / 2
-                sy = (sizes[:,1].unsqueeze(0) + sizes[:,1].unsqueeze(1)) / 2
+                dx = torch.abs(p.unsqueeze(0)[:, :, 0] - p.unsqueeze(1)[:, :, 0])
+                dy = torch.abs(p.unsqueeze(0)[:, :, 1] - p.unsqueeze(1)[:, :, 1])
+                sx = (sizes[:, 0].unsqueeze(0) + sizes[:, 0].unsqueeze(1)) / 2
+                sy = (sizes[:, 1].unsqueeze(0) + sizes[:, 1].unsqueeze(1)) / 2
                 tri = torch.triu(torch.ones(num_hard, num_hard, dtype=torch.bool), diagonal=1)
                 olaps = ((dx < sx) & (dy < sy) & tri).sum().item()
-            
-            print(f"  {benchmark_name} step {step}: pc={proxy_est:.4f} wl={wl_val:.4f} "
-                  f"den={den:.4f} cong={cong:.4f} ovlp={olaps} dw={den_weight:.4f}", flush=True)
-            
+
+            print(
+                f"  {benchmark_name} step {step}: pc={proxy_est:.4f} wl={wl_val:.4f} "
+                f"den={den:.4f} cong={cong:.4f} ovlp={olaps} dw={den_weight:.4f}",
+                flush=True,
+            )
+
             if proxy_est < best_proxy:
                 best_proxy = proxy_est
                 best_placement = placement.detach().clone()
@@ -405,7 +543,8 @@ def run_placer(benchmark_name, num_steps=1500, lr=1.0, momentum=0.9, seed=42):
     print(f"  {benchmark_name} starting legalization with best proxy cost {best_proxy:.4f}")
     legal = legalize_fast(best_placement, benchmark, gap=0.01, max_iters=1000)
     first_legalize_end = time.time()
-    print(f"  First legalization pass took {first_legalize_end - first_legalize_start:.0f}s")   
+    print(f"  First legalization pass took {first_legalize_end - first_legalize_start:.0f}s")
+    # legal = reduce_congestion(legal, benchmark, plc, nets, num_iterations=300)
     costs_final = compute_proxy_cost(legal, benchmark, plc)
     elapsed = time.time() - start
 
@@ -443,10 +582,11 @@ print("=" * 70)
 
 def run_one(name):
     try:
-        costs, placement = run_placer(name, num_steps=1500)
+        costs, placement = run_placer_multiseed(name)
         return name, costs
     except Exception as e:
-        print(f"  {name} FAILED: {e}")
+        traceback.print_exc()
+        print(f"  {name} FAILED: {e}", flush=True)
         return name, {"proxy_cost": float("inf")}
 
 
