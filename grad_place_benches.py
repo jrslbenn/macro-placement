@@ -308,45 +308,14 @@ def run_placer(benchmark_name, num_steps=1500, lr=1.0, momentum=0.9, seed=42):
     legal = legalize_fast(best_placement, benchmark, gap=0.01, max_iters=max_leg_iters)
     first_legalize_end = time.time()
     print(f"  First legalization pass took {first_legalize_end - first_legalize_start:.0f}s")
-    # Second pass if needed
-    second_legalize_start = time.time()
-    print(f"  {benchmark_name} starting second legalization pass")
-    legal = legalize_fast(legal, benchmark, gap=0.01, max_iters=max_leg_iters)
-    second_legalize_end = time.time()
-    print(f"  Second legalization pass took {second_legalize_end - second_legalize_start:.0f}s")
 
-    # Refinement: re-optimize wirelength + density after legalization
-    placement = legal.clone()
-    velocity = torch.zeros_like(placement)
-    for step in range(200):
-        placement.requires_grad_(True)
-        wl = differentiable_wirelength(placement, nets, benchmark,
-                                        net_indices=net_indices, net_mask=net_mask)
-        wl.backward()
-        wl_grad = placement.grad[:num_hard].detach().clone()
-        placement.requires_grad_(False)
-        
-        grid = compute_density_grid(placement, benchmark)
-        potential = solve_poisson(grid, benchmark)
-        density_forces = compute_density_force(potential, placement, benchmark)
-        
-        total_grad = wl_grad - 0.5 * density_forces
-        if benchmark.macro_fixed.any():
-            total_grad[benchmark.macro_fixed[:num_hard]] = 0.0
-        
-        velocity[:num_hard] = 0.5 * velocity[:num_hard] - 0.1 * total_grad
-        placement[:num_hard] += velocity[:num_hard]
-        
-        hw = sizes[:, 0] / 2
-        hh = sizes[:, 1] / 2
-        placement[:num_hard, 0].clamp_(min=hw, max=benchmark.canvas_width - hw)
-        placement[:num_hard, 1].clamp_(min=hh, max=benchmark.canvas_height - hh)
-        if benchmark.macro_fixed.any():
-            placement[benchmark.macro_fixed] = benchmark.macro_positions[benchmark.macro_fixed]
+    # costs_pre_soft = compute_proxy_cost(legal, benchmark, plc)
+    # print(f"  After legal, before soft: den={costs_pre_soft['density_cost']:.4f}")
     
-    # Re-legalize (should be fast with few overlaps)
-    legal = legalize_fast(placement.detach(), benchmark, gap=0.01, max_iters=1000)
-    legal = optimize_soft_macros(legal, nets, benchmark)
+    # legal = optimize_soft_macros(legal, nets, benchmark)
+    
+    # costs_post_soft = compute_proxy_cost(legal, benchmark, plc)
+    # print(f"  After soft: den={costs_post_soft['density_cost']:.4f}")    
     costs_final = compute_proxy_cost(legal, benchmark, plc)
     elapsed = time.time() - start
 
@@ -384,7 +353,7 @@ print("=" * 70)
 
 def run_one(name):
     try:
-        costs, placement = run_placer(name, num_steps=3000)
+        costs, placement = run_placer(name, num_steps=1500)
         return name, costs
     except Exception as e:
         print(f"  {name} FAILED: {e}")
