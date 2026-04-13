@@ -568,6 +568,26 @@ def run_placer(benchmark_name, num_steps=800, lr=1.0, momentum=0.9, seed=42):
     if seed == 0:
         # Start from initial placement
         placement = benchmark.macro_positions.clone()
+        placement.requires_grad_(False)
+        
+        den_weight = 0.01
+        for step in range(200):
+            grid = compute_density_grid_fast(placement, benchmark)
+            potential = solve_poisson(grid, benchmark)
+            forces = compute_density_force_fast(potential, placement, benchmark)
+            placement[:num_hard] += 0.02 * forces
+            
+            # Clamp
+            hw = sizes[:, 0] / 2
+            hh = sizes[:, 1] / 2
+            placement[:num_hard, 0].clamp_(min=hw, max=benchmark.canvas_width - hw)
+            placement[:num_hard, 1].clamp_(min=hh, max=benchmark.canvas_height - hh)
+            if benchmark.macro_fixed.any():
+                placement[benchmark.macro_fixed] = benchmark.macro_positions[benchmark.macro_fixed]
+        
+        legal = legalize_fast(placement, benchmark, gap=0.01, max_iters=1000)
+        costs_final = compute_proxy_cost(legal, benchmark, plc)
+        
     elif seed > 0:
         # Random start
         placement = benchmark.macro_positions.clone()
@@ -640,6 +660,10 @@ def run_placer(benchmark_name, num_steps=800, lr=1.0, momentum=0.9, seed=42):
 
         # t0=time.time()
         wl_grad = placement.grad[:num_hard].detach().clone()
+        wl_grad_full = placement.grad.detach().clone()
+        wl_grad = wl_grad_full[:num_hard]
+        # Scale down soft macro gradient
+        soft_grad = wl_grad_full[num_hard:] * 0.3
         # print("  {} step {}: computed wirelength gradient in {:.1f}ms".format(benchmark_name, step, (time.time() - t0) * 1000))
         placement.requires_grad_(False)
 
@@ -653,31 +677,43 @@ def run_placer(benchmark_name, num_steps=800, lr=1.0, momentum=0.9, seed=42):
         density_forces = compute_density_force_fast(potential, placement, benchmark)
         # print("  {} step {}: computed density forces in {:.1f}ms".format(benchmark_name, step, (time.time() - t0) * 1000))
 
-        if step % 10 == 0:
-            # Density-free step — wirelength only
+        if step < 1000:
+            # Pure wirelength
             total_grad = wl_grad
         else:
-            # Normal step — wirelength + density force
+            # Density spreading to prepare for legalization
             total_grad = wl_grad - den_weight * density_forces
+            
         if benchmark.macro_fixed.any():
             total_grad[benchmark.macro_fixed[:num_hard]] = 0.0
 
         velocity[:num_hard] = momentum * velocity[:num_hard] - lr * total_grad
         placement[:num_hard] += velocity[:num_hard]
 
-        hw = sizes[:, 0] / 2
-        hh = sizes[:, 1] / 2
-        placement[:num_hard, 0].clamp_(min=hw, max=benchmark.canvas_width - hw)
-        placement[:num_hard, 1].clamp_(min=hh, max=benchmark.canvas_height - hh)
+        # Soft macro update (simple gradient descent, no density force)
+        placement.data[num_hard:] -= 0.003 * soft_grad
+        # Clamp all macros to canvas
+        num_all = num_hard + benchmark.num_soft_macros
+        all_sizes = benchmark.macro_sizes[:num_all]
+        hw = all_sizes[:, 0] / 2
+        hh = all_sizes[:, 1] / 2
+        placement.data[:num_all, 0].clamp_(min=hw, max=benchmark.canvas_width - hw)
+        placement.data[:num_all, 1].clamp_(min=hh, max=benchmark.canvas_height - hh)
+
+        if benchmark.macro_fixed.any():
+            placement.data[benchmark.macro_fixed] = benchmark.macro_positions[benchmark.macro_fixed]
 
         if benchmark.macro_fixed.any():
             placement[benchmark.macro_fixed] = benchmark.macro_positions[benchmark.macro_fixed]
 
         if step % 10 == 0 and step > 0:
-            grid = compute_density_grid_fast(placement, benchmark)
-            overflow = (grid - grid.mean()).clamp(min=0).sum().item()
-            if overflow > 0.1:
-                den_weight = min(0.5, den_weight * 1.1)
+            _set_placement(plc, placement.detach(), benchmark)
+            plc.FLAG_UPDATE_WIRELENGTH = False
+            tilos_den = plc.get_density_cost()
+            if tilos_den > 0.85:
+                den_weight = min(0.1, den_weight * 1.1)
+            elif tilos_den < 0.75:
+                den_weight = max(0.001, den_weight * 0.95)  # reduce if overspreading
 
         if step % 200 == 0:
             _set_placement(plc, placement.detach(), benchmark)
