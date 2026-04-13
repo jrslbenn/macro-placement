@@ -1,3 +1,4 @@
+from sklearn.cluster import KMeans
 import traceback
 import random
 import time
@@ -375,7 +376,7 @@ def reduce_congestion(placement, benchmark, plc, nets, num_iterations=500):
     return placement
 
 
-def run_placer_multiseed(benchmark_name, num_steps=800, lr=1.0, momentum=0.9, seeds=[-1, 0, -2]):
+def run_placer_multiseed(benchmark_name, num_steps=800, lr=1.0, momentum=0.9, seeds=[-3,-2,-1,0,42]):
     best_costs = None
     best_legal = None
     best_pc = float("inf")
@@ -415,6 +416,104 @@ def run_placer_multiseed(benchmark_name, num_steps=800, lr=1.0, momentum=0.9, se
     best_costs["best_seed"] = best_seed
     return best_costs, best_legal
 
+def connectivity_init(placement, nets, benchmark, num_clusters=6):
+    num_hard = benchmark.num_hard_macros
+    sizes = benchmark.macro_sizes[:num_hard]
+    
+    # Build adjacency matrix
+    adj = torch.zeros(num_hard, num_hard)
+    for net in nets:
+        hard_members = [m for m in net if m < num_hard]
+        for i in range(len(hard_members)):
+            for j in range(i+1, len(hard_members)):
+                adj[hard_members[i], hard_members[j]] += 1
+                adj[hard_members[j], hard_members[i]] += 1
+    
+    # Spectral clustering
+    # Degree matrix
+    degree = adj.sum(dim=1)
+    D_inv_sqrt = torch.diag(1.0 / (degree.sqrt() + 1e-8))
+    # Normalized Laplacian
+    L = torch.eye(num_hard) - D_inv_sqrt @ adj @ D_inv_sqrt
+    
+    # Smallest eigenvectors (skip first which is constant)
+    eigenvalues, eigenvectors = torch.linalg.eigh(L)
+    features = eigenvectors[:, 1:num_clusters+1]  # use eigenvectors 1..k
+    
+    # K-means on the features (simple version)
+    from sklearn.cluster import KMeans
+    km = KMeans(n_clusters=num_clusters, random_state=42, n_init=10)
+    labels = km.fit_predict(features.numpy())
+    
+    # Assign each cluster to a region of the canvas
+    cols = int(num_clusters ** 0.5) + 1
+    rows_grid = (num_clusters + cols - 1) // cols
+    region_w = benchmark.canvas_width / cols
+    region_h = benchmark.canvas_height / rows_grid
+    
+    for cluster_id in range(num_clusters):
+        members = [i for i in range(num_hard) if labels[i] == cluster_id]
+        if not members:
+            continue
+        
+        # Region center
+        col = cluster_id % cols
+        row = cluster_id // cols
+        region_cx = (col + 0.5) * region_w
+        region_cy = (row + 0.5) * region_h
+        
+        # Place members around region center
+        n = len(members)
+        side = int(n ** 0.5) + 1
+        for idx, macro_id in enumerate(members):
+            if benchmark.macro_fixed[macro_id]:
+                continue
+            local_r = idx // side
+            local_c = idx % side
+            # Spread within region
+            spacing = min(region_w, region_h) / (side + 1)
+            x = region_cx + (local_c - side/2) * spacing
+            y = region_cy + (local_r - side/2) * spacing
+            # Clamp
+            hw = sizes[macro_id, 0].item() / 2
+            hh = sizes[macro_id, 1].item() / 2
+            x = max(hw, min(benchmark.canvas_width - hw, x))
+            y = max(hh, min(benchmark.canvas_height - hh, y))
+            placement[macro_id, 0] = x
+            placement[macro_id, 1] = y
+    
+    return placement
+
+def optimize_soft_macros_gentle(placement, nets, benchmark, alpha=0.3):
+    """Move each soft macro partially toward centroid of connected macros."""
+    num_hard = benchmark.num_hard_macros
+    num_soft = benchmark.num_soft_macros
+
+    for i in range(num_soft):
+        soft_idx = num_hard + i
+        connected = set()
+        for net in nets:
+            if soft_idx in net:
+                connected.update(net)
+        connected.discard(soft_idx)
+        if not connected:
+            continue
+
+        target_x = sum(placement[j, 0].item() for j in connected) / len(connected)
+        target_y = sum(placement[j, 1].item() for j in connected) / len(connected)
+
+        # Move alpha fraction toward target (0.3 = 30% of the way)
+        old_x = placement[soft_idx, 0].item()
+        old_y = placement[soft_idx, 1].item()
+        new_x = old_x + alpha * (target_x - old_x)
+        new_y = old_y + alpha * (target_y - old_y)
+
+        w = benchmark.macro_sizes[soft_idx, 0].item()
+        h = benchmark.macro_sizes[soft_idx, 1].item()
+        placement[soft_idx, 0] = max(w/2, min(benchmark.canvas_width - w/2, new_x))
+        placement[soft_idx, 1] = max(h/2, min(benchmark.canvas_height - h/2, new_y))
+
+    return placement
 
 def run_placer(benchmark_name, num_steps=800, lr=1.0, momentum=0.9, seed=42):
     random.seed(seed)
@@ -432,7 +531,7 @@ def run_placer(benchmark_name, num_steps=800, lr=1.0, momentum=0.9, seed=42):
     net_indices, net_mask = precompute_net_tensors(nets)
     num_hard = benchmark.num_hard_macros
     sizes = benchmark.macro_sizes[:num_hard]
-
+    
     if seed == -1:
         start = time.time()
         # Gentle density-only optimization from initial placement
@@ -506,6 +605,11 @@ def run_placer(benchmark_name, num_steps=800, lr=1.0, momentum=0.9, seed=42):
         )
         return costs_final, legal
 
+    if seed == -3:
+        placement = benchmark.macro_positions.clone()
+        placement = connectivity_init(placement, nets, benchmark, num_clusters=6)
+        # Then fall through to the normal optimization loop below
+
     velocity = torch.zeros_like(placement)
     den_weight = 0.001
     best_proxy = float("inf")
@@ -514,7 +618,7 @@ def run_placer(benchmark_name, num_steps=800, lr=1.0, momentum=0.9, seed=42):
     start = time.time()
 
     net_weights = None
-    for step in range(800):
+    for step in range(1300):
         # Update net weights every 100 steps
         if step % 100 == 0 and step > 0:
             # t0=time.time()
@@ -594,7 +698,7 @@ def run_placer(benchmark_name, num_steps=800, lr=1.0, momentum=0.9, seed=42):
                 olaps = ((dx < sx) & (dy < sy) & tri).sum().item()
 
             print(
-                f"  {benchmark_name} step {step}: pc={proxy_est:.4f} wl={wl_val:.4f} "
+                f"  {benchmark_name}.{seed}.{step}: pc={proxy_est:.4f} wl={wl_val:.4f} "
                 f"den={den:.4f} cong={cong:.4f} ovlp={olaps} dw={den_weight:.4f}",
                 flush=True,
             )
@@ -603,13 +707,23 @@ def run_placer(benchmark_name, num_steps=800, lr=1.0, momentum=0.9, seed=42):
                 best_proxy = proxy_est
                 best_placement = placement.detach().clone()
 
+    # After optimization, before legalization, add:
+    hard_only = [n for n in nets if all(m < num_hard for m in n)]
+    mixed = [n for n in nets if any(m < num_hard for m in n) and any(m >= num_hard for m in n)]
+    soft_only = [n for n in nets if all(m >= num_hard for m in n)]
+
+    print(f"Hard-only nets: {len(hard_only)}")
+    print(f"Mixed nets: {len(mixed)}")
+    print(f"Soft-only nets: {len(soft_only)}")
+    print(f"Total: {len(nets)}")
+    
     # Legalize
     first_legalize_start = time.time()
     print(f"  {benchmark_name} starting legalization with best proxy cost {best_proxy:.4f}")
     legal = legalize_fast(best_placement, benchmark, gap=0.01, max_iters=1000)
     first_legalize_end = time.time()
     print(f"  First legalization pass took {first_legalize_end - first_legalize_start:.0f}s")
-    # legal = reduce_congestion(legal, benchmark, plc, nets, num_iterations=300)
+    legal = optimize_soft_macros_gentle(legal, nets, benchmark, alpha=.05)
     costs_final = compute_proxy_cost(legal, benchmark, plc)
     costs_final["seed"] = seed
     elapsed = time.time() - start
