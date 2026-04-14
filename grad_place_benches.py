@@ -755,7 +755,7 @@ def _run_optimization_loop(
         bbox_area = x_span * y_span + 1e-6
         rudy_loss = ((x_span + y_span) / bbox_area).sum() / len(nets)
  
-        loss = wl + 0.1 * rudy_loss
+        loss = wl + 0 * rudy_loss
         loss.backward()
  
         wl_grad = placement.grad.detach().clone()
