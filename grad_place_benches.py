@@ -583,105 +583,90 @@ def prep_placer(seed, benchmark_name):
     return plc, benchmark
 
 
-def run_placer(benchmark_name, strategy="random", num_steps=800, lr=1.0, momentum=0.9, seed=42):
-    plc, benchmark = prep_placer(seed, benchmark_name)
-    nets = extract_nets(plc, benchmark)
-    net_indices, net_mask = precompute_net_tensors(nets)
+# ---------------------------------------------------------------------------
+# Initialization strategies
+# ---------------------------------------------------------------------------
+ 
+def _make_initial_placement(strategy, benchmark, nets, seed):
+    """
+    Return (placement, early_result) where:
+      - placement  : initial torch tensor to feed into the optimizer
+      - early_result : (costs, legal) if this strategy bypasses optimization, else None
+    """
     num_hard = benchmark.num_hard_macros
     sizes = benchmark.macro_sizes[:num_hard]
-
+ 
+    # ------------------------------------------------------------------
+    # Strategies that skip the optimizer entirely
+    # ------------------------------------------------------------------
+ 
+    if strategy == "initial":
+        # Option A: pure legalized initial
+        legal_a = legalize_fast(benchmark.macro_positions.clone(), benchmark, gap=0.01, max_iters=1000)
+        costs_a = compute_proxy_cost(legal_a, benchmark, _make_plc(seed, benchmark))
+ 
+        # Option B: light density spreading from initial, then legalize
+        placement_b = benchmark.macro_positions.clone()
+        hw, hh = sizes[:, 0] / 2, sizes[:, 1] / 2
+        for _ in range(200):
+            grid = compute_density_grid_fast(placement_b, benchmark)
+            forces = compute_density_force_fast(solve_poisson(grid, benchmark), placement_b, benchmark)
+            placement_b[:num_hard] += 0.02 * forces
+            placement_b[:num_hard, 0].clamp_(min=hw, max=benchmark.canvas_width - hw)
+            placement_b[:num_hard, 1].clamp_(min=hh, max=benchmark.canvas_height - hh)
+            if benchmark.macro_fixed.any():
+                placement_b[benchmark.macro_fixed] = benchmark.macro_positions[benchmark.macro_fixed]
+        legal_b = legalize_fast(placement_b, benchmark, gap=0.01, max_iters=1000)
+        costs_b = compute_proxy_cost(legal_b, benchmark, _make_plc(seed, benchmark))
+ 
+        if _a_wins(costs_a, costs_b):
+            winner = "pure initial"
+            costs, legal = costs_a, legal_a
+        else:
+            winner = "density-spread initial"
+            costs, legal = costs_b, legal_b
+ 
+        print(f"  [initial] picked {winner}: pc={costs['proxy_cost']:.4f}", flush=True)
+        return None, (costs, legal)
+ 
     if strategy == "gentle_density":
-        start = time.time()
-        # Gentle density-only optimization from initial placement
         placement = benchmark.macro_positions.clone()
-        placement.requires_grad_(False)
-
-        for step in range(num_steps // 5):
+        hw, hh = sizes[:, 0] / 2, sizes[:, 1] / 2
+        for _ in range(160):   # ~800/5
             grid = compute_density_grid_fast(placement, benchmark)
-            potential = solve_poisson(grid, benchmark)
-            forces = compute_density_force_fast(potential, placement, benchmark)
-
-            # Very small steps, density only, no wirelength
+            forces = compute_density_force_fast(solve_poisson(grid, benchmark), placement, benchmark)
             placement[:num_hard] += 0.05 * forces
-
-            hw = sizes[:, 0] / 2
-            hh = sizes[:, 1] / 2
             placement[:num_hard, 0].clamp_(min=hw, max=benchmark.canvas_width - hw)
             placement[:num_hard, 1].clamp_(min=hh, max=benchmark.canvas_height - hh)
             if benchmark.macro_fixed.any():
                 placement[benchmark.macro_fixed] = benchmark.macro_positions[benchmark.macro_fixed]
-
         legal = legalize_fast(placement, benchmark, gap=0.01, max_iters=1000)
-        costs_final = compute_proxy_cost(legal, benchmark, plc)
-        costs_final["seed"] = seed
-        elapsed = time.time() - start
-        print(
-            f"  {benchmark_name} FINAL (gentle density): pc={costs_final['proxy_cost']:.4f} "
-            f"wl={costs_final['wirelength_cost']:.4f} den={costs_final['density_cost']:.4f} "
-            f"cong={costs_final['congestion_cost']:.4f} ovlp={costs_final['overlap_count']}",
-            flush=True,
-        )
-        return costs_final, legal
-
-    if strategy == "initial":
-        start = time.time()
-
-        # Option A: pure legalized initial
-        placement_a = benchmark.macro_positions.clone()
-        legal_a = legalize_fast(placement_a, benchmark, gap=0.01, max_iters=1000)
-        costs_a = compute_proxy_cost(legal_a, benchmark, plc)
-
-        # Option B: your density optimization on initial
-        placement_b = benchmark.macro_positions.clone()
-        for step in range(200):
-            grid = compute_density_grid_fast(placement_b, benchmark)
-            potential = solve_poisson(grid, benchmark)
-            forces = compute_density_force_fast(potential, placement_b, benchmark)
-            placement_b[:num_hard] += 0.02 * forces
-            hw = sizes[:, 0] / 2
-            hh = sizes[:, 1] / 2
-            placement_b[:num_hard, 0].clamp_(min=hw, max=benchmark.canvas_width - hw)
-            placement_b[:num_hard, 1].clamp_(min=hh, max=benchmark.canvas_height - hh)
-            if benchmark.macro_fixed.any():
-                placement_b[benchmark.macro_fixed] = benchmark.macro_positions[
-                    benchmark.macro_fixed
-                ]
-        legal_b = legalize_fast(placement_b, benchmark, gap=0.01, max_iters=1000)
-        costs_b = compute_proxy_cost(legal_b, benchmark, plc)
-
-        # Pick better
-        if (
-            (costs_a["overlap_count"] == 0 and costs_b["overlap_count"] > 0)
-            or (
-                costs_a["overlap_count"] == 0
-                and costs_b["overlap_count"] == 0
-                and costs_a["proxy_cost"] <= costs_b["proxy_cost"]
-            )
-            or (
-                costs_a["overlap_count"] > 0
-                and costs_b["overlap_count"] > 0
-                and costs_a["proxy_cost"] <= costs_b["proxy_cost"]
-            )
-        ):
-            costs_final = costs_a
-            legal = legal_a
-            print(
-                f"  {benchmark_name} seed 0: picked pure initial ({costs_a['proxy_cost']:.4f})",
-                flush=True,
-            )
-        else:
-            costs_final = costs_b
-            legal = legal_b
-            print(
-                f"  {benchmark_name} seed 0: picked optimized ({costs_b['proxy_cost']:.4f})",
-                flush=True,
-            )
-
-        costs_final["seed"] = seed
-        return costs_final, legal
-
+        costs = compute_proxy_cost(legal, benchmark, _make_plc(seed, benchmark))
+        return None, (costs, legal)
+ 
+    if strategy == "scaling":
+        placement = benchmark.macro_positions.clone()
+        cx, cy = benchmark.canvas_width / 2, benchmark.canvas_height / 2
+        scale = 1.05
+        hw_all = sizes[:, 0] / 2
+        hh_all = sizes[:, 1] / 2
+        for i in range(num_hard):
+            if not benchmark.macro_fixed[i]:
+                placement[i, 0] = (cx + (placement[i, 0] - cx) * scale).clamp(
+                    hw_all[i], benchmark.canvas_width - hw_all[i]
+                )
+                placement[i, 1] = (cy + (placement[i, 1] - cy) * scale).clamp(
+                    hh_all[i], benchmark.canvas_height - hh_all[i]
+                )
+        legal = legalize_fast(placement, benchmark, gap=0.01, max_iters=1000)
+        costs = compute_proxy_cost(legal, benchmark, _make_plc(seed, benchmark))
+        return None, (costs, legal)
+ 
+    # ------------------------------------------------------------------
+    # Strategies that feed into the optimizer
+    # ------------------------------------------------------------------
+ 
     if strategy == "random":
-        # Random start
         placement = benchmark.macro_positions.clone()
         for i in range(num_hard):
             if not benchmark.macro_fixed[i]:
@@ -691,150 +676,138 @@ def run_placer(benchmark_name, strategy="random", num_steps=800, lr=1.0, momentu
                 placement[i, 1] = random.uniform(
                     sizes[i, 1].item() / 2, benchmark.canvas_height - sizes[i, 1].item() / 2
                 )
-
-    if strategy == "scaling":
-        placement = benchmark.macro_positions.clone()
-        cx = benchmark.canvas_width / 2
-        cy = benchmark.canvas_height / 2
-        scale = 1.05  # gentler scaling
-        for i in range(num_hard):
-            if not benchmark.macro_fixed[i]:
-                placement[i, 0] = cx + (placement[i, 0] - cx) * scale
-                placement[i, 1] = cy + (placement[i, 1] - cy) * scale
-                hw = sizes[i, 0].item() / 2
-                hh = sizes[i, 1].item() / 2
-                placement[i, 0] = max(hw, min(benchmark.canvas_width - hw, placement[i, 0].item()))
-                placement[i, 1] = max(hh, min(benchmark.canvas_height - hh, placement[i, 1].item()))
-
-        legal = legalize_fast(placement, benchmark, gap=0.01, max_iters=1000)
-        costs_final = compute_proxy_cost(legal, benchmark, plc)
-        costs_final["seed"] = seed
-        print(
-            f"  {benchmark_name} FINAL (scaled 1.05): pc={costs_final['proxy_cost']:.4f} "
-            f"wl={costs_final['wirelength_cost']:.4f} den={costs_final['density_cost']:.4f} "
-            f"cong={costs_final['congestion_cost']:.4f} ovlp={costs_final['overlap_count']}",
-            flush=True,
-        )
-        return costs_final, legal
-
+        return placement, None
+ 
     if strategy == "connectivity":
         placement = benchmark.macro_positions.clone()
         placement = connectivity_init(placement, nets, benchmark, num_clusters=6)
-        # Then fall through to the normal optimization loop below
-
+        return placement, None
+ 
+    raise ValueError(f"Unknown strategy: {strategy!r}")
+ 
+ 
+# ---------------------------------------------------------------------------
+# Nesterov optimization loop
+# ---------------------------------------------------------------------------
+ 
+def _run_optimization_loop(
+    placement,
+    benchmark,
+    nets,
+    net_indices,
+    net_mask,
+    plc,
+    num_steps=800,
+    lr=1.0,
+    momentum=0.9,
+    density_phase_start=0.85,   # fraction of num_steps at which density kicks in
+    benchmark_name="?",
+    seed=42,
+):
+    """
+    Pure Nesterov loop. Mutates `placement` in-place and returns
+    (best_proxy_cost, best_placement).
+ 
+    Two-phase schedule:
+      [0, density_phase_start * num_steps)  — wirelength only
+      [density_phase_start * num_steps, end) — WL + density spreading
+    """
+    num_hard = benchmark.num_hard_macros
+    num_all = num_hard + benchmark.num_soft_macros
+    sizes = benchmark.macro_sizes[:num_hard]
+    all_sizes = benchmark.macro_sizes[:num_all]
+    hw_all = all_sizes[:, 0] / 2
+    hh_all = all_sizes[:, 1] / 2
+    hw = sizes[:, 0] / 2
+    hh = sizes[:, 1] / 2
+ 
+    density_phase_step = int(num_steps * density_phase_start)
+ 
     velocity = torch.zeros_like(placement)
     den_weight = 0.001
     best_proxy = float("inf")
     best_placement = placement.clone()
-
-    start = time.time()
-
-    net_weights = None
+ 
     for step in range(num_steps):
-        # Update net weights every 100 steps
-        if step % 100 == 0 and step > 0:
-            # t0=time.time()
-            # with torch.no_grad():
-            # placement.data = optimize_soft_macros(placement.detach(), nets, benchmark).data
-            _set_placement(plc, placement.detach(), benchmark)
-            plc.FLAG_UPDATE_WIRELENGTH = False
-            net_weights = compute_net_weights(placement.detach(), nets, benchmark, plc)
-            # print("  {} step {}: computed net weights in {:.1f}ms".format(benchmark_name, step, (time.time() - t0) * 1000))
-
+ 
+        # --- Wirelength gradient (log-sum-exp HPWL + RUDY) ---
         placement.requires_grad_(True)
         pos_net = placement[net_indices]
         x, y = pos_net[:, :, 0], pos_net[:, :, 1]
         alpha = 10.0
+ 
         x_for_max = x.masked_fill(~net_mask, float("-inf"))
         x_for_min = x.masked_fill(~net_mask, float("inf"))
         y_for_max = y.masked_fill(~net_mask, float("-inf"))
         y_for_min = y.masked_fill(~net_mask, float("inf"))
-
+ 
         x_max = (1 / alpha) * torch.logsumexp(alpha * x_for_max, dim=1)
         x_min = -(1 / alpha) * torch.logsumexp(-alpha * x_for_min, dim=1)
         y_max = (1 / alpha) * torch.logsumexp(alpha * y_for_max, dim=1)
         y_min = -(1 / alpha) * torch.logsumexp(-alpha * y_for_min, dim=1)
-
+ 
         x_span = x_max - x_min
         y_span = y_max - y_min
-
-        wl = (x_span + y_span).sum() / (
-            len(nets) * (benchmark.canvas_width + benchmark.canvas_height)
-        )
-
-        # RUDY
+        canvas_norm = benchmark.canvas_width + benchmark.canvas_height
+ 
+        wl = (x_span + y_span).sum() / (len(nets) * canvas_norm)
+ 
         bbox_area = x_span * y_span + 1e-6
-        net_demand = (x_span + y_span) / bbox_area
-        rudy_loss = net_demand.sum() / len(nets)
-
+        rudy_loss = ((x_span + y_span) / bbox_area).sum() / len(nets)
+ 
         loss = wl + 0.1 * rudy_loss
         loss.backward()
-
-        wl_grad = placement.grad[:num_hard].detach().clone()
-        wl_grad_full = placement.grad.detach().clone()
-        wl_grad = wl_grad_full[:num_hard]
-        # Scale down soft macro gradient
-        soft_grad = wl_grad_full[num_hard:] * 0.3
-        # print("  {} step {}: computed wirelength gradient in {:.1f}ms".format(benchmark_name, step, (time.time() - t0) * 1000))
+ 
+        wl_grad = placement.grad.detach().clone()
         placement.requires_grad_(False)
-
-        # t0=time.time()
+ 
+        # --- Density forces ---
         grid = compute_density_grid_fast(placement, benchmark)
-        # print("  {} step {}: computed density grid in {:.1f}ms".format(benchmark_name, step, (time.time() - t0) * 1000))
-        # t0=time.time()
-        potential = solve_poisson(grid, benchmark)
-        # print("  {} step {}: solved Poisson in {:.1f}ms".format(benchmark_name, step, (time.time() - t0) * 1000))
-        # t0=time.time()
-        density_forces = compute_density_force_fast(potential, placement, benchmark)
-        # print("  {} step {}: computed density forces in {:.1f}ms".format(benchmark_name, step, (time.time() - t0) * 1000))
-
-        if step < 1500:
-            # Pure wirelength
-            total_grad = wl_grad
-        else:
-            # Density spreading to prepare for legalization
-            total_grad = wl_grad - den_weight * density_forces
-
+        density_forces = compute_density_force_fast(solve_poisson(grid, benchmark), placement, benchmark)
+ 
+        # --- Two-phase gradient combination ---
+        hard_grad = wl_grad[:num_hard]
+        if step >= density_phase_step:
+            hard_grad = hard_grad - den_weight * density_forces
+ 
         if benchmark.macro_fixed.any():
-            total_grad[benchmark.macro_fixed[:num_hard]] = 0.0
-
-        velocity[:num_hard] = momentum * velocity[:num_hard] - lr * total_grad
+            hard_grad[benchmark.macro_fixed[:num_hard]] = 0.0
+ 
+        # --- Nesterov update for hard macros ---
+        velocity[:num_hard] = momentum * velocity[:num_hard] - lr * hard_grad
         placement[:num_hard] += velocity[:num_hard]
-
-        # Soft macro update (simple gradient descent, no density force)
+        placement.data[:num_hard, 0].clamp_(min=hw, max=benchmark.canvas_width - hw)
+        placement.data[:num_hard, 1].clamp_(min=hh, max=benchmark.canvas_height - hh)
+ 
+        # --- Soft macro co-optimization (gradient descent, no density) ---
+        soft_grad = wl_grad[num_hard:] * 0.3
         placement.data[num_hard:] -= 0.003 * soft_grad
-        # Clamp all macros to canvas
-        num_all = num_hard + benchmark.num_soft_macros
-        all_sizes = benchmark.macro_sizes[:num_all]
-        hw = all_sizes[:, 0] / 2
-        hh = all_sizes[:, 1] / 2
-        placement.data[:num_all, 0].clamp_(min=hw, max=benchmark.canvas_width - hw)
-        placement.data[:num_all, 1].clamp_(min=hh, max=benchmark.canvas_height - hh)
-
+        placement.data[num_hard:, 0].clamp_(min=hw_all[num_hard:], max=benchmark.canvas_width - hw_all[num_hard:])
+        placement.data[num_hard:, 1].clamp_(min=hh_all[num_hard:], max=benchmark.canvas_height - hh_all[num_hard:])
+ 
+        # --- Restore fixed macros ---
         if benchmark.macro_fixed.any():
             placement.data[benchmark.macro_fixed] = benchmark.macro_positions[benchmark.macro_fixed]
-
-        if benchmark.macro_fixed.any():
-            placement[benchmark.macro_fixed] = benchmark.macro_positions[benchmark.macro_fixed]
-
-        if step % 10 == 0 and step > 0:
+ 
+        # --- Adaptive density weight (every 10 steps, post density phase) ---
+        if step >= density_phase_step and step % 10 == 0:
             _set_placement(plc, placement.detach(), benchmark)
             plc.FLAG_UPDATE_WIRELENGTH = False
             tilos_den = plc.get_density_cost()
             if tilos_den > 0.85:
                 den_weight = min(0.1, den_weight * 1.1)
             elif tilos_den < 0.75:
-                den_weight = max(0.001, den_weight * 0.95)  # reduce if overspreading
-
+                den_weight = max(0.001, den_weight * 0.95)
+ 
+        # --- Logging + best tracking (every 200 steps) ---
         if step % 200 == 0:
             _set_placement(plc, placement.detach(), benchmark)
             plc.FLAG_UPDATE_WIRELENGTH = False
             den = plc.get_density_cost()
             cong = plc.get_congestion_cost()
-            wl_val = wl.item()  # already computed this step
+            wl_val = wl.item()
             proxy_est = wl_val + 0.5 * den + 0.5 * cong
-
-            # Count overlaps fast
+ 
             with torch.no_grad():
                 p = placement[:num_hard].detach()
                 dx = torch.abs(p.unsqueeze(0)[:, :, 0] - p.unsqueeze(1)[:, :, 0])
@@ -843,47 +816,122 @@ def run_placer(benchmark_name, strategy="random", num_steps=800, lr=1.0, momentu
                 sy = (sizes[:, 1].unsqueeze(0) + sizes[:, 1].unsqueeze(1)) / 2
                 tri = torch.triu(torch.ones(num_hard, num_hard, dtype=torch.bool), diagonal=1)
                 olaps = ((dx < sx) & (dy < sy) & tri).sum().item()
-
+ 
+            phase = "density" if step >= density_phase_step else "wl-only"
             print(
-                f"  {benchmark_name}.{seed}.{step}: pc={proxy_est:.4f} wl={wl_val:.4f} "
-                f"den={den:.4f} cong={cong:.4f} ovlp={olaps} dw={den_weight:.4f}",
+                f"  {benchmark_name}:{step} [{phase}]: "
+                f"pc={proxy_est:.4f} wl={wl_val:.4f} den={den:.4f} "
+                f"cong={cong:.4f} ovlp={olaps} dw={den_weight:.4f}",
                 flush=True,
             )
-
+ 
             if proxy_est < best_proxy:
                 best_proxy = proxy_est
                 best_placement = placement.detach().clone()
-
-    # After optimization, before legalization, add:
-    hard_only = [n for n in nets if all(m < num_hard for m in n)]
-    mixed = [n for n in nets if any(m < num_hard for m in n) and any(m >= num_hard for m in n)]
-    soft_only = [n for n in nets if all(m >= num_hard for m in n)]
-
-    print(f"Hard-only nets: {len(hard_only)}")
-    print(f"Mixed nets: {len(mixed)}")
-    print(f"Soft-only nets: {len(soft_only)}")
-    print(f"Total: {len(nets)}")
-
-    # Legalize
-    first_legalize_start = time.time()
-    print(f"  {benchmark_name} starting legalization with best proxy cost {best_proxy:.4f}")
-    legal = legalize_fast(best_placement, benchmark, gap=0.01, max_iters=1000)
-    first_legalize_end = time.time()
-    print(f"  First legalization pass took {first_legalize_end - first_legalize_start:.0f}s")
-    legal = optimize_soft_macros_gentle(legal, nets, benchmark, alpha=0.05)
-    costs_final = compute_proxy_cost(legal, benchmark, plc)
-    costs_final["seed"] = seed
-    elapsed = time.time() - start
-
-    print(
-        f"  {benchmark_name} FINAL: pc={costs_final['proxy_cost']:.4f} "
-        f"wl={costs_final['wirelength_cost']:.4f} den={costs_final['density_cost']:.4f} "
-        f"cong={costs_final['congestion_cost']:.4f} ovlp={costs_final['overlap_count']} "
-        f"time={elapsed:.0f}s"
+ 
+    return best_proxy, best_placement
+ 
+ 
+# ---------------------------------------------------------------------------
+# Public entry point
+# ---------------------------------------------------------------------------
+ 
+def run_placer(
+    benchmark_name,
+    strategy="random",
+    num_steps=800,
+    lr=1.0,
+    momentum=0.9,
+    density_phase_start=0.85,
+    seed=42,
+):
+    """
+    Main entry point. Returns (costs_dict, final_placement).
+ 
+    Strategies that skip the optimizer:
+        "initial"         — legalized initial vs light density-spread initial, pick best
+        "gentle_density"  — density-only nudge from initial, then legalize
+        "scaling"         — scale-out from initial, then legalize
+ 
+    Strategies that run the full optimizer:
+        "random"          — uniform random start
+        "connectivity"    — spectral clustering init
+    """
+    plc, benchmark = prep_placer(seed, benchmark_name)
+    nets = extract_nets(plc, benchmark)
+    net_indices, net_mask = precompute_net_tensors(nets)
+ 
+    start = time.time()
+ 
+    # --- Initialization (may return early for bypass strategies) ---
+    placement, early_result = _make_initial_placement(strategy, benchmark, nets, seed)
+ 
+    if early_result is not None:
+        costs, legal = early_result
+        costs["seed"] = seed
+        elapsed = time.time() - start
+        _print_final(benchmark_name, strategy, costs, elapsed)
+        return costs, legal
+ 
+    # --- Full optimization ---
+    best_proxy, best_placement = _run_optimization_loop(
+        placement=placement,
+        benchmark=benchmark,
+        nets=nets,
+        net_indices=net_indices,
+        net_mask=net_mask,
+        plc=plc,
+        num_steps=num_steps,
+        lr=lr,
+        momentum=momentum,
+        density_phase_start=density_phase_start,
+        benchmark_name=benchmark_name,
+        seed=seed,
     )
-
-    return costs_final, legal
-
+ 
+    # --- Legalization + soft macro refinement ---
+    t_leg = time.time()
+    legal = legalize_fast(best_placement, benchmark, gap=0.01, max_iters=1000)
+    print(f"  Legalization took {time.time() - t_leg:.1f}s", flush=True)
+    legal = optimize_soft_macros_gentle(legal, nets, benchmark, alpha=0.05)
+ 
+    costs = compute_proxy_cost(legal, benchmark, plc)
+    costs["seed"] = seed
+ 
+    elapsed = time.time() - start
+    _print_final(benchmark_name, strategy, costs, elapsed)
+    return costs, legal
+ 
+ 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+ 
+def _make_plc(seed, benchmark):
+    """Thin wrapper so early-exit strategies can get a fresh plc."""
+    plc, _ = prep_placer(seed, benchmark.name)
+    return plc
+ 
+ 
+def _a_wins(costs_a, costs_b):
+    """Return True if costs_a is strictly better than costs_b."""
+    oa, ob = costs_a["overlap_count"], costs_b["overlap_count"]
+    pa, pb = costs_a["proxy_cost"], costs_b["proxy_cost"]
+    if oa == 0 and ob > 0:
+        return True
+    if oa > 0 and ob == 0:
+        return False
+    return pa <= pb
+ 
+ 
+def _print_final(benchmark_name, strategy, costs, elapsed):
+    print(
+        f"  {benchmark_name} FINAL [{strategy}]: "
+        f"pc={costs['proxy_cost']:.4f} wl={costs['wirelength_cost']:.4f} "
+        f"den={costs['density_cost']:.4f} cong={costs['congestion_cost']:.4f} "
+        f"ovlp={costs['overlap_count']} time={elapsed:.0f}s",
+        flush=True,
+    )
 
 BENCHMARKS = [
     "ibm01",
