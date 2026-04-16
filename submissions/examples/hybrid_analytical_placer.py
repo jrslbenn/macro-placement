@@ -12,7 +12,6 @@ import cProfile
 import pstats
 import io
 import random
-import heapq
 from pathlib import Path
 from time import time
 from typing import List, Optional, Tuple
@@ -120,7 +119,7 @@ class HybridAnalyticalPlacer:
     def __init__(
         self,
         seed: int = 42,
-        num_steps: int = 2000,
+        num_steps: int = 10000,
         lr: float = 1.0,
         momentum: float = 0.9,
         soft_macro_lr: float = 0.15,
@@ -136,8 +135,8 @@ class HybridAnalyticalPlacer:
         self.verbose = verbose
 
     def place(self, benchmark: Benchmark) -> torch.Tensor:
-        pr = cProfile.Profile()
-        pr.enable()
+        # pr = cProfile.Profile()
+        # pr.enable()
         random.seed(self.seed)
         torch.manual_seed(self.seed)
 
@@ -155,6 +154,33 @@ class HybridAnalyticalPlacer:
         net_indices, net_mask = self._precompute_net_tensors(nets)
         placement = self._make_initial_placement(placement, benchmark, nets, net_indices, net_mask)
 
+        hard_sizes = benchmark.macro_sizes[:num_hard]
+
+        # ── Precompute benchmark-fixed tensors (avoid recomputing every step) ──
+        # Poisson solver eigenvalues
+        _j = torch.arange(benchmark.grid_rows, dtype=torch.float32)
+        _k = torch.arange(benchmark.grid_cols, dtype=torch.float32)
+        _eig = (
+            (2 * torch.cos(torch.pi * _j / benchmark.grid_rows)).unsqueeze(1)
+            + (2 * torch.cos(torch.pi * _k / benchmark.grid_cols)).unsqueeze(0)
+            - 4
+        )
+        _eig[0, 0] = 1.0
+        self._poisson_eigenvalues = _eig
+        # Density grid bin boundaries
+        self._bin_w = benchmark.canvas_width / benchmark.grid_cols
+        self._bin_h = benchmark.canvas_height / benchmark.grid_rows
+        self._bin_left = torch.arange(benchmark.grid_cols, dtype=torch.float32) * self._bin_w
+        self._bin_right = self._bin_left + self._bin_w
+        self._bin_bottom = torch.arange(benchmark.grid_rows, dtype=torch.float32) * self._bin_h
+        self._bin_top = self._bin_bottom + self._bin_h
+        # Legalization / overlap-count tensors (sep_x_base has no gap; gap added at call time)
+        self._leg_sep_x_base = (hard_sizes[:, 0].unsqueeze(1) + hard_sizes[:, 0].unsqueeze(0)) / 2
+        self._leg_sep_y_base = (hard_sizes[:, 1].unsqueeze(1) + hard_sizes[:, 1].unsqueeze(0)) / 2
+        self._leg_tri = torch.triu(torch.ones(num_hard, num_hard, dtype=torch.bool), diagonal=1)
+        self._leg_half_w = hard_sizes[:, 0] / 2
+        self._leg_half_h = hard_sizes[:, 1] / 2
+
         # Legalize initial placement before optimization starts
         placement = self._legalize_fast(placement, benchmark, gap=0.02, max_iters=400)
         overlaps = self._hard_overlap_count(placement, benchmark)
@@ -164,7 +190,6 @@ class HybridAnalyticalPlacer:
             placement = strong_legalize(placement, benchmark, gap=0.02, max_iters=40)
             print("Done strong legalization of initial placement")
 
-        hard_sizes = benchmark.macro_sizes[:num_hard]
         all_sizes = benchmark.macro_sizes[:num_all]
         hw_hard = hard_sizes[:, 0] / 2
         hh_hard = hard_sizes[:, 1] / 2
@@ -193,7 +218,7 @@ class HybridAnalyticalPlacer:
         self._log_stats("start", benchmark, placement, plc, wl=None, density_weight=density_weight)
 
         start_time = time()
-        time_budget = 60  # 4 minutes in seconds
+        time_budget = 240  # 4 minutes in seconds
         step = 0
         top_k_candidates = []  # list of (proxy_est, step, placement)
         for step in range(self.num_steps):
@@ -264,21 +289,26 @@ class HybridAnalyticalPlacer:
             if (step + 1) % track_every == 0:
                 if plc is not None:
                     sync_plc(step)
-
-                den = plc.get_density_cost()
-                proxy_est = wl.item() + 0.5 * plc.get_density_cost() + 0.5 * plc.get_congestion_cost()
+                    den_cost = plc.get_density_cost()
+                    cong_cost = plc.get_congestion_cost()
+                    proxy_est = wl.item() + 0.5 * den_cost + 0.5 * cong_cost
+                else:
+                    proxy_est = wl.item()
                 top_k_candidates.append((proxy_est, step, placement.detach().clone()))
                 top_k_candidates.sort(key=lambda x: x[0])
                 top_k_candidates = top_k_candidates[:K]
-                
-                # full logging every 1/10 steps
+
+            # full logging every 1/10 steps
             if (step + 1) % log_every == 0 or step >= self.num_steps - 1:
                 if plc is not None:
                     sync_plc(step)
-                # metrics = compute_proxy_cost(placement, benchmark, plc) if plc is not None else None
-                proxy_est = wl.item() + 0.5 * plc.get_density_cost() + 0.5 * plc.get_congestion_cost()
-                self._log_stats(f"step_{step+1}", benchmark, placement, plc, wl=wl.item(), density_weight=density_weight)
-                    
+                    metrics = compute_proxy_cost(placement.detach(), benchmark, plc)
+                    proxy_est = metrics["proxy_cost"]
+                else:
+                    metrics = None
+                    proxy_est = wl.item()
+                self._log_stats(f"step_{step+1}", benchmark, placement, plc, wl=wl.item(), density_weight=density_weight, metrics=metrics)
+
                 recent_proxies.append(float(proxy_est))
                 if len(recent_proxies) > 3:
                     improvement = recent_proxies[-4] - recent_proxies[-1]
@@ -297,10 +327,10 @@ class HybridAnalyticalPlacer:
                 if self._hard_overlap_count(c, benchmark) == 0:
                     break
                 c = self._legalize_fast(c, benchmark, gap=0.01, max_iters=200)
-            
+
             # if self._hard_overlap_count(c, benchmark) > 0:
             #     c = strong_legalize(c, benchmark, gap=0.01, max_iters=120)
-            
+
             if self._hard_overlap_count(c, benchmark) == 0:
                 _set_placement(plc, c.detach(), benchmark)
                 proxy = compute_proxy_cost(c, benchmark, plc)["proxy_cost"]
@@ -317,32 +347,27 @@ class HybridAnalyticalPlacer:
 
         final = best_valid_placement
         self._log_stats("final", benchmark, final, plc, wl=None, density_weight=density_weight)
-        pr.disable()
-        s = io.StringIO()
-        pstats.Stats(pr, stream=s).sort_stats('cumulative').print_stats(20)
-        print(s.getvalue())
+        # pr.disable()
+        # s = io.StringIO()
+        # pstats.Stats(pr, stream=s).sort_stats('cumulative').print_stats(20)
+        # print(s.getvalue())
         return final
 
     def _compute_overlap_penalty(
         self, placement: torch.Tensor, benchmark: Benchmark
     ) -> torch.Tensor:
         num_hard = benchmark.num_hard_macros
-        sizes = benchmark.macro_sizes[:num_hard]
         pos = placement[:num_hard]
-
-        sep_x = (sizes[:, 0].unsqueeze(1) + sizes[:, 0].unsqueeze(0)) / 2
-        sep_y = (sizes[:, 1].unsqueeze(1) + sizes[:, 1].unsqueeze(0)) / 2
 
         dx = torch.abs(pos[:, 0].unsqueeze(1) - pos[:, 0].unsqueeze(0))
         dy = torch.abs(pos[:, 1].unsqueeze(1) - pos[:, 1].unsqueeze(0))
 
         # penetration depth in each axis, 0 if no overlap
-        overlap_x = torch.clamp(sep_x - dx, min=0)
-        overlap_y = torch.clamp(sep_y - dy, min=0)
+        overlap_x = torch.clamp(self._leg_sep_x_base - dx, min=0)
+        overlap_y = torch.clamp(self._leg_sep_y_base - dy, min=0)
 
         # penalty is product of penetration depths — zero unless overlapping in both axes
-        tri = torch.triu(torch.ones(num_hard, num_hard, dtype=torch.bool), diagonal=1)
-        penalty = (overlap_x * overlap_y * tri).sum()
+        penalty = (overlap_x * overlap_y * self._leg_tri).sum()
 
         return penalty / (num_hard**2)  # normalize by macro count
 
@@ -525,10 +550,6 @@ class HybridAnalyticalPlacer:
     ) -> torch.Tensor:
         num_macros = benchmark.num_macros
         sizes = benchmark.macro_sizes[:num_macros]
-        grid_rows = benchmark.grid_rows
-        grid_cols = benchmark.grid_cols
-        bin_w = benchmark.canvas_width / grid_cols
-        bin_h = benchmark.canvas_height / grid_rows
 
         cx = placement[:num_macros, 0]
         cy = placement[:num_macros, 1]
@@ -539,52 +560,40 @@ class HybridAnalyticalPlacer:
         bottom = cy - half_h
         top = cy + half_h
 
-        bin_left = torch.arange(grid_cols, dtype=placement.dtype) * bin_w
-        bin_right = bin_left + bin_w
-        bin_bottom = torch.arange(grid_rows, dtype=placement.dtype) * bin_h
-        bin_top = bin_bottom + bin_h
-
         overlap_x = torch.clamp(
-            torch.min(right.unsqueeze(1), bin_right.unsqueeze(0))
-            - torch.max(left.unsqueeze(1), bin_left.unsqueeze(0)),
+            torch.min(right.unsqueeze(1), self._bin_right.unsqueeze(0))
+            - torch.max(left.unsqueeze(1), self._bin_left.unsqueeze(0)),
             min=0,
         )
         overlap_y = torch.clamp(
-            torch.min(top.unsqueeze(1), bin_top.unsqueeze(0))
-            - torch.max(bottom.unsqueeze(1), bin_bottom.unsqueeze(0)),
+            torch.min(top.unsqueeze(1), self._bin_top.unsqueeze(0))
+            - torch.max(bottom.unsqueeze(1), self._bin_bottom.unsqueeze(0)),
             min=0,
         )
-        return torch.mm(overlap_y.t(), overlap_x) / (bin_w * bin_h)
+        return torch.mm(overlap_y.t(), overlap_x) / (self._bin_w * self._bin_h)
 
     def _solve_poisson(self, density_grid: torch.Tensor) -> torch.Tensor:
-        rows, cols = density_grid.shape
         rho = density_grid - density_grid.mean()
         rho_freq = torch.tensor(dctn(rho.numpy()), dtype=torch.float32)
-        j = torch.arange(rows, dtype=torch.float32)
-        k = torch.arange(cols, dtype=torch.float32)
-        eig_j = 2 * torch.cos(torch.pi * j / rows)
-        eig_k = 2 * torch.cos(torch.pi * k / cols)
-        eigenvalues = eig_j.unsqueeze(1) + eig_k.unsqueeze(0) - 4
-        eigenvalues[0, 0] = 1
-        potential = torch.tensor(idctn((rho_freq / eigenvalues).numpy()), dtype=torch.float32)
+        potential = torch.tensor(
+            idctn((rho_freq / self._poisson_eigenvalues).numpy()), dtype=torch.float32
+        )
         return -potential
 
     def _compute_density_force_fast(
         self, potential: torch.Tensor, placement: torch.Tensor, benchmark: Benchmark
     ) -> torch.Tensor:
         num_all = benchmark.num_macros
-        bin_w = benchmark.canvas_width / benchmark.grid_cols
-        bin_h = benchmark.canvas_height / benchmark.grid_rows
 
         grad_x = torch.zeros_like(potential)
         grad_y = torch.zeros_like(potential)
-        grad_x[:, 1:-1] = (potential[:, 2:] - potential[:, :-2]) / (2 * bin_w)
-        grad_y[1:-1, :] = (potential[2:, :] - potential[:-2, :]) / (2 * bin_h)
+        grad_x[:, 1:-1] = (potential[:, 2:] - potential[:, :-2]) / (2 * self._bin_w)
+        grad_y[1:-1, :] = (potential[2:, :] - potential[:-2, :]) / (2 * self._bin_h)
 
         cx = placement[:num_all, 0].detach()
         cy = placement[:num_all, 1].detach()
-        c_bins = (cx / bin_w).long().clamp(0, benchmark.grid_cols - 1)
-        r_bins = (cy / bin_h).long().clamp(0, benchmark.grid_rows - 1)
+        c_bins = (cx / self._bin_w).long().clamp(0, benchmark.grid_cols - 1)
+        r_bins = (cy / self._bin_h).long().clamp(0, benchmark.grid_rows - 1)
 
         forces = torch.zeros(num_all, 2)
         forces[:, 0] = -grad_x[r_bins, c_bins]
@@ -596,12 +605,11 @@ class HybridAnalyticalPlacer:
     ) -> torch.Tensor:
         placement = placement.clone()
         num_hard = benchmark.num_hard_macros
-        sizes = benchmark.macro_sizes[:num_hard]
-        half_w = sizes[:, 0] / 2
-        half_h = sizes[:, 1] / 2
-        sep_x = (sizes[:, 0].unsqueeze(1) + sizes[:, 0].unsqueeze(0)) / 2 + gap
-        sep_y = (sizes[:, 1].unsqueeze(1) + sizes[:, 1].unsqueeze(0)) / 2 + gap
-        tri = torch.triu(torch.ones(num_hard, num_hard, dtype=torch.bool), diagonal=1)
+        sep_x = self._leg_sep_x_base + gap
+        sep_y = self._leg_sep_y_base + gap
+        tri = self._leg_tri
+        half_w = self._leg_half_w
+        half_h = self._leg_half_h
 
         for _ in range(max_iters):
             pos = placement[:num_hard]
@@ -614,8 +622,8 @@ class HybridAnalyticalPlacer:
                 break
             pairs = overlap_mask.nonzero(as_tuple=False)
             pair_areas = (
-                sizes[pairs[:, 0], 0] * sizes[pairs[:, 0], 1]
-                + sizes[pairs[:, 1], 0] * sizes[pairs[:, 1], 1]
+                benchmark.macro_sizes[pairs[:, 0], 0] * benchmark.macro_sizes[pairs[:, 0], 1]
+                + benchmark.macro_sizes[pairs[:, 1], 0] * benchmark.macro_sizes[pairs[:, 1], 1]
             )
             pairs = pairs[pair_areas.argsort(descending=True)]
             for p in range(pairs.shape[0]):
@@ -640,58 +648,16 @@ class HybridAnalyticalPlacer:
             placement[:num_hard, 1].clamp_(min=half_h, max=benchmark.canvas_height - half_h)
         return placement
 
-    def _optimize_soft_macros_gentle(
-        self,
-        placement: torch.Tensor,
-        nets: List[List[int]],
-        benchmark: Benchmark,
-        alpha: float = 0.3,
-    ) -> torch.Tensor:
-        num_hard = benchmark.num_hard_macros
-        num_soft = benchmark.num_soft_macros
-        for i in range(num_soft):
-            soft_idx = num_hard + i
-            connected = set()
-            for net in nets:
-                if soft_idx in net:
-                    connected.update(net)
-            connected.discard(soft_idx)
-            if not connected:
-                continue
-            target_x = sum(float(placement[j, 0].item()) for j in connected) / len(connected)
-            target_y = sum(float(placement[j, 1].item()) for j in connected) / len(connected)
-            old_x = float(placement[soft_idx, 0].item())
-            old_y = float(placement[soft_idx, 1].item())
-            new_x = old_x + alpha * (target_x - old_x)
-            new_y = old_y + alpha * (target_y - old_y)
-            w = benchmark.macro_sizes[soft_idx, 0].item()
-            h = benchmark.macro_sizes[soft_idx, 1].item()
-            placement[soft_idx, 0] = max(w / 2, min(benchmark.canvas_width - w / 2, new_x))
-            placement[soft_idx, 1] = max(h / 2, min(benchmark.canvas_height - h / 2, new_y))
-        return placement
-
     def _hard_overlap_count(self, placement: torch.Tensor, benchmark: Benchmark) -> int:
         num_hard = benchmark.num_hard_macros
         if num_hard <= 1:
             return 0
-        sizes = benchmark.macro_sizes[:num_hard]
         p = placement[:num_hard]
         dx = torch.abs(p.unsqueeze(0)[:, :, 0] - p.unsqueeze(1)[:, :, 0])
         dy = torch.abs(p.unsqueeze(0)[:, :, 1] - p.unsqueeze(1)[:, :, 1])
-        sx = (sizes[:, 0].unsqueeze(0) + sizes[:, 0].unsqueeze(1)) / 2
-        sy = (sizes[:, 1].unsqueeze(0) + sizes[:, 1].unsqueeze(1)) / 2
-        tri = torch.triu(torch.ones(num_hard, num_hard, dtype=torch.bool), diagonal=1)
-        overlap_mask = (dx < sx) & (dy < sy) & tri
-
-        # Debug: print overlapping pairs
-        # pairs = overlap_mask.nonzero()
-        # if len(pairs) > 0 and len(pairs) <= 100:  # only print if manageable
-        #     for pair in pairs:
-        #         i, j = pair[0].item(), pair[1].item()
-        #         print(f"  overlap: macro {i} ({sizes[i,0]:.1f}x{sizes[i,1]:.1f}) "
-        #             f"vs macro {j} ({sizes[j,0]:.1f}x{sizes[j,1]:.1f})")
-
-        return int(((dx < sx) & (dy < sy) & tri).sum().item())
+        return int(
+            ((dx < self._leg_sep_x_base) & (dy < self._leg_sep_y_base) & self._leg_tri).sum().item()
+        )
 
     def _log_stats(
         self,
@@ -701,12 +667,14 @@ class HybridAnalyticalPlacer:
         plc,
         wl: Optional[float],
         density_weight: float,
+        metrics: Optional[dict] = None,
     ) -> None:
         if not self.verbose:
             return
         overlaps = self._hard_overlap_count(placement, benchmark)
         if plc is not None:
-            metrics = compute_proxy_cost(placement, benchmark, plc)
+            if metrics is None:
+                metrics = compute_proxy_cost(placement, benchmark, plc)
             wl_value = wl if wl is not None else metrics["wirelength_cost"]
             print(
                 f"[{benchmark.name}] {label:<12} "
