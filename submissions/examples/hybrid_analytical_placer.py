@@ -119,7 +119,7 @@ class HybridAnalyticalPlacer:
     def __init__(
         self,
         seed: int = 42,
-        num_steps: int = 10000,
+        num_steps: int = 15000,
         lr: float = 1.0,
         momentum: float = 0.9,
         soft_macro_lr: float = 0.15,
@@ -151,7 +151,7 @@ class HybridAnalyticalPlacer:
         if not nets:
             return placement
 
-        net_indices, net_mask = self._precompute_net_tensors(nets)
+        net_indices, net_mask, net_weights = self._precompute_net_tensors(nets)
         placement = self._make_initial_placement(placement, benchmark, nets, net_indices, net_mask)
 
         hard_sizes = benchmark.macro_sizes[:num_hard]
@@ -184,7 +184,9 @@ class HybridAnalyticalPlacer:
         # Legalize initial placement before optimization starts
         placement = self._legalize_fast(placement, benchmark, gap=0.02, max_iters=400)
         overlaps = self._hard_overlap_count(placement, benchmark)
-        print(f"Initial placement has {overlaps} overlaps among {num_hard} macros after fast legalization")
+        print(
+            f"Initial placement has {overlaps} overlaps among {num_hard} macros after fast legalization"
+        )
         if overlaps > num_hard // 3:
             print(f"fast legal failed, applying strong legalization to fix {overlaps}")
             placement = strong_legalize(placement, benchmark, gap=0.02, max_iters=40)
@@ -198,10 +200,12 @@ class HybridAnalyticalPlacer:
         fixed = benchmark.macro_fixed
 
         velocity = torch.zeros_like(placement)
-        density_weight = 0.0001
+        base_lr = self.lr
+
+        density_weight = 0.001
         canvas_norm = benchmark.canvas_width + benchmark.canvas_height
-        log_every = max(1, self.num_steps // 10)      # print stats every 1/10
-        track_every = max(1, self.num_steps // 50)    # track top-k candidates every 1/50
+        log_every = max(1, self.num_steps // 10)  # print stats every 1/10
+        track_every = max(1, self.num_steps // 50)  # track top-k candidates every 1/50
         plc_synced_at = -1
         K = 3
         recent_proxies = []  # moved outside loop so it accumulates
@@ -218,31 +222,44 @@ class HybridAnalyticalPlacer:
         self._log_stats("start", benchmark, placement, plc, wl=None, density_weight=density_weight)
 
         start_time = time()
-        time_budget = 240  # 4 minutes in seconds
+        time_budget = 300  # 5 minutes in seconds
         step = 0
         top_k_candidates = []  # list of (proxy_est, step, placement)
         for step in range(self.num_steps):
+            # Cosine LR schedule
+            progress = step / self.num_steps
+            current_lr = base_lr * (0.5 * (1 + math.cos(math.pi * progress)))
+            current_lr = max(current_lr, base_lr * 0.05)  # floor at 5% of base
+            
             if step % 50 == 0:
-                print(f"Step {step}/{self.num_steps} - Time elapsed: {time() - start_time:.1f}s", end="\r")
+                print(
+                    f"Step {step}/{self.num_steps} - Time elapsed: {time() - start_time:.1f}s",
+                    end="\r",
+                )
             if time() - start_time > time_budget:
                 print(f"Time budget reached at step {step} ")
                 break
-
             # Periodic mid-run legalization to prevent overlap compounding
-            if step % 200 == 0 and step > 0:
-                old_pos = placement[:num_hard].clone()
-                placement = self._legalize_fast(placement, benchmark, gap=0.02, max_iters=100)
-                moved = (placement[:num_hard] - old_pos).abs().sum(dim=1) > 1e-4
-                velocity[:num_hard][moved] = 0.0
+            if step % 50 == 0:
+                overlaps = self._hard_overlap_count(placement, benchmark)
+                if overlaps > 10 and step % 200 == 0:
+                    old_pos = placement[:num_hard].clone()
+                    placement = self._legalize_fast(placement, benchmark, gap=0.02, max_iters=100)
+                    moved = (placement[:num_hard] - old_pos).abs().sum(dim=1) > 1e-4
+                    velocity[:num_hard][moved] = 0.0
 
-            placement.requires_grad_(True)
+            # Nesterov: compute gradient at lookahead position
+            lookahead = placement.clone()
+            lookahead[:num_hard] = placement[:num_hard] + self.momentum * velocity[:num_hard]
+            lookahead.requires_grad_(True)
             loss, wl = self._compute_wl_loss(
-                placement, net_indices, net_mask, nets, canvas_norm, self.rudy_weight
+                lookahead, net_indices, net_mask, nets, canvas_norm, self.rudy_weight, net_weights=net_weights
             )
             loss.backward()
-            wl_grad = placement.grad.detach().clone()
-            placement.requires_grad_(False)
+            wl_grad = lookahead.grad.detach().clone()
+            lookahead.requires_grad_(False)
 
+            # Density forces still computed at current position (cheaper, stable)
             grid = self._compute_density_grid_fast(placement, benchmark)
             density_forces = self._compute_density_force_fast(
                 self._solve_poisson(grid), placement, benchmark
@@ -253,7 +270,8 @@ class HybridAnalyticalPlacer:
             if fixed.any():
                 hard_grad[fixed[:num_hard]] = 0.0
 
-            velocity[:num_hard] = self.momentum * velocity[:num_hard] - self.lr * hard_grad
+            # Nesterov velocity update
+            velocity[:num_hard] = self.momentum * velocity[:num_hard] - current_lr * hard_grad
             placement[:num_hard] = (placement[:num_hard] + velocity[:num_hard]).clamp(
                 min=torch.stack([hw_hard, hh_hard], dim=1),
                 max=torch.stack(
@@ -276,14 +294,25 @@ class HybridAnalyticalPlacer:
 
             # Adaptive density weight controller
             if step % 20 == 0 and plc is not None:
-
+                wl_grad_norm = wl_grad[:num_hard].norm()
+                den_grad_norm = density_forces[:num_hard].norm()
                 sync_plc(step)
 
-                tilos_den = plc.get_density_cost()
-                if tilos_den > 0.9:
-                    density_weight = min(0.005, density_weight * 1.05)
-                elif tilos_den < 0.7:
-                    density_weight = max(0.0001, density_weight * 0.95)
+                # Add this line:
+                # if step % 200 == 0:
+                #     print(f"  step={step} wl_norm={wl_grad_norm:.6f} den_norm={den_grad_norm:.6f} "
+                #         f"ratio={wl_grad_norm / (density_weight * den_grad_norm + 1e-12):.2f} "
+                #         f"dw={density_weight:.6f}")
+                    
+                if den_grad_norm > 1e-8:
+                    progress = step / self.num_steps
+                    # We want: wl_grad_norm ≈ target_ratio * density_weight * den_grad_norm
+                    # So density_weight should be: wl_grad_norm / (target_ratio * den_grad_norm)
+                    target_ratio = 5.0 * (1 - progress) + 0.5 * progress
+                    ideal_dw = wl_grad_norm / (target_ratio * den_grad_norm + 1e-12)
+                    # Smooth update toward ideal, don't jump
+                    density_weight = 0.9 * density_weight + 0.1 * ideal_dw.item()
+                    density_weight = max(1e-5, min(0.05, density_weight))
 
             # cheap top-k tracking every 1/50 steps
             if (step + 1) % track_every == 0:
@@ -307,7 +336,16 @@ class HybridAnalyticalPlacer:
                 else:
                     metrics = None
                     proxy_est = wl.item()
-                self._log_stats(f"step_{step+1}", benchmark, placement, plc, wl=wl.item(), density_weight=density_weight, metrics=metrics)
+                self._log_stats(
+                    f"step_{step+1}",
+                    benchmark,
+                    placement,
+                    plc,
+                    wl=wl.item(),
+                    density_weight=density_weight,
+                    metrics=metrics,
+                    rudy_weight=self.rudy_weight,
+                )
 
                 recent_proxies.append(float(proxy_est))
                 if len(recent_proxies) > 3:
@@ -322,14 +360,15 @@ class HybridAnalyticalPlacer:
         best_valid_placement = None
 
         for proxy_est, ckpt_step, candidate in top_k_candidates:
+            pre_wl = self._compute_wl_loss(candidate, net_indices, net_mask, nets, canvas_norm, 0.0)[1].item()
             c = candidate.clone()
             for _ in range(8):
                 if self._hard_overlap_count(c, benchmark) == 0:
                     break
                 c = self._legalize_fast(c, benchmark, gap=0.01, max_iters=200)
 
-            # if self._hard_overlap_count(c, benchmark) > 0:
-            #     c = strong_legalize(c, benchmark, gap=0.01, max_iters=120)
+            if self._hard_overlap_count(c, benchmark) > 0:
+                c = strong_legalize(c, benchmark, gap=0.01, max_iters=40)
 
             if self._hard_overlap_count(c, benchmark) == 0:
                 _set_placement(plc, c.detach(), benchmark)
@@ -337,6 +376,9 @@ class HybridAnalyticalPlacer:
                 if proxy < best_valid_proxy:
                     best_valid_proxy = proxy
                     best_valid_placement = c.clone()
+
+            post_wl = self._compute_wl_loss(c, net_indices, net_mask, nets, canvas_norm, 0.0)[1].item()
+            print(f"  checkpoint step={ckpt_step}: wl {pre_wl:.4f} -> {post_wl:.4f}")
 
         # fallback to final placement if no valid checkpoint found
         if best_valid_placement is None:
@@ -439,7 +481,11 @@ class HybridAnalyticalPlacer:
         for i, net in enumerate(nets):
             net_indices[i, : len(net)] = torch.tensor(net, dtype=torch.long)
             net_mask[i, : len(net)] = True
-        return net_indices, net_mask
+        # Net degree weights: downweight high-fanout nets
+        degrees = torch.tensor([len(n) for n in nets], dtype=torch.float32)
+        net_weights = 1.0 / torch.log2(degrees.clamp(min=2))
+        net_weights /= net_weights.mean()  # normalize so total gradient scale stays similar
+        return net_indices, net_mask, net_weights
 
     def _make_initial_placement(
         self,
@@ -483,11 +529,12 @@ class HybridAnalyticalPlacer:
         nets: List[List[int]],
         canvas_norm: float,
         rudy_weight: float = 0.0,
+        net_weights=None,
+        alpha=6.0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         pos_net = placement[net_indices]
         x = pos_net[:, :, 0]
         y = pos_net[:, :, 1]
-        alpha = 6
 
         x_max = (1 / alpha) * torch.logsumexp(
             alpha * x.masked_fill(~net_mask, float("-inf")), dim=1
@@ -504,11 +551,19 @@ class HybridAnalyticalPlacer:
 
         x_span = x_max - x_min
         y_span = y_max - y_min
-        wl = (x_span + y_span).sum() / (len(nets) * canvas_norm)
+        span = x_span + y_span
+
+        if net_weights is not None:
+            span = span * net_weights
+
+        wl = span.sum() / (len(nets) * canvas_norm)
 
         if rudy_weight > 0.0:
             bbox_area = x_span * y_span + 1e-6
-            rudy_loss = ((x_span + y_span) / bbox_area).sum() / len(nets)
+            rudy_terms = (x_span + y_span) / bbox_area
+            if net_weights is not None:
+                rudy_terms = rudy_terms * net_weights
+            rudy_loss = rudy_terms.sum() / len(nets)
             return wl + rudy_weight * rudy_loss, wl
         return wl, wl
 
@@ -531,7 +586,8 @@ class HybridAnalyticalPlacer:
         placement = placement.clone()
         for _ in range(steps):
             placement.requires_grad_(True)
-            loss, _ = self._compute_wl_loss(placement, net_indices, net_mask, nets, canvas_norm)
+            alpha = 5.0 + 8.0 * (_ / steps)  # gradually increase alpha for sharper gradients
+            loss, _ = self._compute_wl_loss(placement, net_indices, net_mask, nets, canvas_norm, net_weights=None, alpha=alpha, rudy_weight=self.rudy_weight)
             loss.backward()
             soft_grad = placement.grad.detach()[num_hard:num_all]
             placement.requires_grad_(False)
@@ -667,6 +723,7 @@ class HybridAnalyticalPlacer:
         plc,
         wl: Optional[float],
         density_weight: float,
+        rudy_weight: Optional[float] = None,
         metrics: Optional[dict] = None,
     ) -> None:
         if not self.verbose:
@@ -684,6 +741,7 @@ class HybridAnalyticalPlacer:
                 f"cong={metrics['congestion_cost']:.4f} "
                 f"ovlp={metrics['overlap_count']} "
                 f"dw={density_weight:.4f}",
+                f"rudy_w={self.rudy_weight:.4f}",
                 flush=True,
             )
         else:
