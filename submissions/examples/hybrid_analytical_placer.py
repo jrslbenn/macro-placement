@@ -119,7 +119,7 @@ class HybridAnalyticalPlacer:
     def __init__(
         self,
         seed: int = 42,
-        num_steps: int = 20000,
+        num_steps: int = 50000,
         lr: float = 1.0,
         momentum: float = 0.9,
         soft_macro_lr: float = 0.15,
@@ -153,9 +153,10 @@ class HybridAnalyticalPlacer:
         placement = self._make_initial_placement(placement, benchmark, nets, net_indices, net_mask)
 
         hard_sizes = benchmark.macro_sizes[:num_hard]
+        hw_hard = hard_sizes[:, 0] / 2
+        hh_hard = hard_sizes[:, 1] / 2
 
-        # ── Precompute benchmark-fixed tensors (avoid recomputing every step) ──
-        # Poisson solver eigenvalues
+        # ── Precompute benchmark-fixed tensors ──
         _j = torch.arange(benchmark.grid_rows, dtype=torch.float32)
         _k = torch.arange(benchmark.grid_cols, dtype=torch.float32)
         _eig = (
@@ -165,48 +166,45 @@ class HybridAnalyticalPlacer:
         )
         _eig[0, 0] = 1.0
         self._poisson_eigenvalues = _eig
-        # Density grid bin boundaries
         self._bin_w = benchmark.canvas_width / benchmark.grid_cols
         self._bin_h = benchmark.canvas_height / benchmark.grid_rows
         self._bin_left = torch.arange(benchmark.grid_cols, dtype=torch.float32) * self._bin_w
         self._bin_right = self._bin_left + self._bin_w
         self._bin_bottom = torch.arange(benchmark.grid_rows, dtype=torch.float32) * self._bin_h
         self._bin_top = self._bin_bottom + self._bin_h
-        # Legalization / overlap-count tensors (sep_x_base has no gap; gap added at call time)
         self._leg_sep_x_base = (hard_sizes[:, 0].unsqueeze(1) + hard_sizes[:, 0].unsqueeze(0)) / 2
         self._leg_sep_y_base = (hard_sizes[:, 1].unsqueeze(1) + hard_sizes[:, 1].unsqueeze(0)) / 2
         self._leg_tri = torch.triu(torch.ones(num_hard, num_hard, dtype=torch.bool), diagonal=1)
         self._leg_half_w = hard_sizes[:, 0] / 2
         self._leg_half_h = hard_sizes[:, 1] / 2
-
-        # Legalize initial placement before optimization starts
+            
+        # ── Initial legalization ──
         placement = self._legalize_fast(placement, benchmark, gap=0.02, max_iters=400)
         overlaps = self._hard_overlap_count(placement, benchmark)
-        print(
-            f"Initial placement has {overlaps} overlaps among {num_hard} macros after fast legalization"
-        )
+        print(f"Initial placement has {overlaps} overlaps among {num_hard} macros after fast legalization")
         if overlaps > num_hard // 3:
             print(f"fast legal failed, applying strong legalization to fix {overlaps}")
             placement = strong_legalize(placement, benchmark, gap=0.02, max_iters=40)
             print("Done strong legalization of initial placement")
 
         all_sizes = benchmark.macro_sizes[:num_all]
-        hw_hard = hard_sizes[:, 0] / 2
-        hh_hard = hard_sizes[:, 1] / 2
         hw_all = all_sizes[:, 0] / 2
         hh_all = all_sizes[:, 1] / 2
         fixed = benchmark.macro_fixed
 
         velocity = torch.zeros_like(placement)
         base_lr = self.lr
-
         density_weight = 0.001
         canvas_norm = benchmark.canvas_width + benchmark.canvas_height
-        log_every = max(1, self.num_steps // 10)  # print stats every 1/10
-        track_every = max(1, self.num_steps // 50)  # track top-k candidates every 1/50
+        log_every = max(1, self.num_steps // 10)
+        track_every = max(1, self.num_steps // 50)
         plc_synced_at = -1
-        K = 5  # keep top 5 candidates for final selection
-        recent_proxies = []  # moved outside loop so it accumulates
+        K = 5
+        recent_proxies = []
+        top_k_candidates = []
+
+        # cached congestion force — updated every 20 steps with plc sync
+        cong_force_cached = torch.zeros(num_hard, 2)
 
         def sync_plc(step: int) -> None:
             nonlocal plc_synced_at
@@ -217,42 +215,34 @@ class HybridAnalyticalPlacer:
                 plc.FLAG_UPDATE_WIRELENGTH = False
                 plc_synced_at = step
 
+        print('logging start')
         self._log_stats("start", benchmark, placement, plc, wl=None, density_weight=density_weight)
 
         start_time = time()
-        time_budget = 600  # 4 minutes in seconds
+        time_budget = 600
         step = 0
-        top_k_candidates = []  # list of (proxy_est, step, placement)
         
+        print('starting iters')
         for step in range(self.num_steps):
-
-            # # in the main loop, every N steps
-            # if step % 500 == 0 and step > 0:
-            #     placement = self._settle_soft_macros(
-            #         placement, net_indices, net_mask, nets, benchmark, num_hard, steps=100, lr=0.05
-            #     )
-            # Cosine LR schedule
             progress = step / self.num_steps
             current_lr = base_lr * (0.5 * (1 + math.cos(math.pi * progress)))
-            current_lr = max(current_lr, base_lr * 0.05)  # floor at 5% of base
-            
+            current_lr = max(current_lr, base_lr * 0.05)
+
             if step % 50 == 0:
-                print(
-                    f"Step {step}/{self.num_steps} - Time elapsed: {time() - start_time:.1f}s",
-                    end="\r",
-                )
+                print(f"Step {step}/{self.num_steps} - Time elapsed: {time() - start_time:.1f}s", end="\r")
             if time() - start_time > time_budget:
-                print(f"Time budget reached at step {step} ")
+                print(f"Time budget reached at step {step}")
                 break
 
-            # Periodic mid-run legalization to prevent overlap compounding
+            # # Periodic mid-run legalization
             if step % 200 == 0 and step > 0:
-                old_pos = placement[:num_hard].clone()
-                placement = self._legalize_fast(placement, benchmark, gap=0.01, max_iters=40)
-                moved = (placement[:num_hard] - old_pos).abs().sum(dim=1) > 1e-4
-                velocity[:num_hard][moved] = 0.0
+                if self._hard_overlap_count(placement, benchmark) > 0:
+                    old_pos = placement[:num_hard].clone()
+                    placement = self._legalize_fast(placement, benchmark, gap=0.01, max_iters=40)
+                    moved = (placement[:num_hard] - old_pos).abs().sum(dim=1) > 1e-4
+                    velocity[:num_hard][moved] = 0.0
 
-            # Nesterov: compute gradient at lookahead position
+            # 1. WL gradient at lookahead
             lookahead = placement.clone()
             lookahead[:num_hard] = placement[:num_hard] + self.momentum * velocity[:num_hard]
             lookahead.requires_grad_(True)
@@ -263,57 +253,51 @@ class HybridAnalyticalPlacer:
             wl_grad = lookahead.grad.detach().clone()
             lookahead.requires_grad_(False)
 
-            # Density forces still computed at current position (cheaper, stable)
+            # 2. Density forces at current position
             grid = self._compute_density_grid_fast(placement, benchmark)
             density_forces = self._compute_density_force_fast(
                 self._solve_poisson(grid), placement, benchmark
             )
 
-            hard_grad = wl_grad[:num_hard].clone()
-            hard_grad -= density_weight * density_forces[:num_hard]
-            if fixed.any():
-                hard_grad[fixed[:num_hard]] = 0.0
-
-            # Nesterov velocity update
-            velocity[:num_hard] = self.momentum * velocity[:num_hard] - current_lr * hard_grad
-            placement[:num_hard] = (placement[:num_hard] + velocity[:num_hard]).clamp(
-                min=torch.stack([hw_hard, hh_hard], dim=1),
-                max=torch.stack(
-                    [benchmark.canvas_width - hw_hard, benchmark.canvas_height - hh_hard], dim=1
-                ),
-            )
-
-            soft_grad = wl_grad[num_hard:num_all].clone()
-            soft_grad -= 0.01 * density_forces[num_hard:num_all]
-            placement[num_hard:num_all] -= self.soft_macro_lr * soft_grad
-            placement[num_hard:num_all, 0].clamp_(
-                min=hw_all[num_hard:], max=benchmark.canvas_width - hw_all[num_hard:]
-            )
-            placement[num_hard:num_all, 1].clamp_(
-                min=hh_all[num_hard:], max=benchmark.canvas_height - hh_all[num_hard:]
-            )
-
-            if fixed.any():
-                placement[fixed] = benchmark.macro_positions[fixed]
-
-            # Adaptive density weight controller
-            if step % 20 == 0 and plc is not None:
-
+            # 3. Adaptive density weight + congestion force update (every 20 steps)
+            if step % 200 == 0 and plc is not None:
                 sync_plc(step)
-
                 tilos_den = plc.get_density_cost()
                 if tilos_den > 0.9:
                     density_weight = min(0.005, density_weight * 1.05)
                 elif tilos_den < 0.7:
-                    density_weight = max(0.0005, density_weight * 0.95)
+                    density_weight = max(0.0001, density_weight * 0.95)
 
-            # cheap top-k tracking every 1/50 steps
+            # 4. Combined gradient
+            hard_grad = wl_grad[:num_hard].clone()
+            hard_grad -= density_weight * density_forces[:num_hard]
+            # hard_grad = hard_grad / (precond_hard + 1e-8)  # precondition: larger macros get bigger steps
+            if fixed.any():
+                hard_grad[fixed[:num_hard]] = 0.0
+
+            # 5. Nesterov update
+            velocity[:num_hard] = self.momentum * velocity[:num_hard] - current_lr * hard_grad
+            placement[:num_hard] = (placement[:num_hard] + velocity[:num_hard]).clamp(
+                min=torch.stack([hw_hard, hh_hard], dim=1),
+                max=torch.stack([benchmark.canvas_width - hw_hard, benchmark.canvas_height - hh_hard], dim=1),
+            )
+
+            # 6. Soft macros
+            soft_grad = wl_grad[num_hard:num_all].clone()
+            soft_grad -= 0.01 * density_forces[num_hard:num_all]
+            placement[num_hard:num_all] -= self.soft_macro_lr * soft_grad
+            placement[num_hard:num_all, 0].clamp_(min=hw_all[num_hard:], max=benchmark.canvas_width - hw_all[num_hard:])
+            placement[num_hard:num_all, 1].clamp_(min=hh_all[num_hard:], max=benchmark.canvas_height - hh_all[num_hard:])
+
+            if fixed.any():
+                placement[fixed] = benchmark.macro_positions[fixed]
+
+            # 7. Top-k tracking
             if (step + 1) % track_every == 0:
                 if plc is not None:
                     sync_plc(step)
                     den_cost = plc.get_density_cost()
                     cong_cost = plc.get_congestion_cost()
-                                        # After computing congestion cost in the tracking block:
                     proxy_est = wl.item() + 0.5 * den_cost + 0.5 * cong_cost
                 else:
                     proxy_est = wl.item()
@@ -321,7 +305,7 @@ class HybridAnalyticalPlacer:
                 top_k_candidates.sort(key=lambda x: x[0])
                 top_k_candidates = top_k_candidates[:K]
 
-            # full logging every 1/10 steps
+            # 8. Full logging
             if (step + 1) % log_every == 0 or step >= self.num_steps - 1:
                 if plc is not None:
                     sync_plc(step)
@@ -331,24 +315,14 @@ class HybridAnalyticalPlacer:
                     metrics = None
                     proxy_est = wl.item()
                 self._log_stats(
-                    f"step_{step+1}",
-                    benchmark,
-                    placement,
-                    plc,
-                    wl=wl.item(),
-                    density_weight=density_weight,
-                    metrics=metrics,
+                    f"step_{step+1}", benchmark, placement, plc,
+                    wl=wl.item(), density_weight=density_weight, metrics=metrics,
                 )
-
                 recent_proxies.append(float(proxy_est))
-                # if len(recent_proxies) > 3:
-                #     improvement = recent_proxies[-4] - recent_proxies[-1]
-                #     if improvement < 0.001 and step > self.num_steps // 2:
-                #         print(f"Early stopping at step {step}")
-                #         break
 
             placement = placement.detach()
-        # legalize all top-k checkpoints and pick best valid result
+
+        # ── Post-optimization: legalize top-k and pick best ──
         best_valid_proxy = float("inf")
         best_valid_placement = None
 
@@ -358,26 +332,21 @@ class HybridAnalyticalPlacer:
                 if self._hard_overlap_count(c, benchmark) == 0:
                     break
                 c = self._legalize_fast(c, benchmark, gap=0.01 * (i + 1), max_iters=200)
-
             if self._hard_overlap_count(c, benchmark) > 0:
-                print("attempting strong elgalize")
+                print("attempting strong legalize")
                 c = strong_legalize(c, benchmark, gap=0.01, max_iters=40)
                 print(f"strong legalize finished: {self._hard_overlap_count(c, benchmark)}")
-                
             if self._hard_overlap_count(c, benchmark) == 0:
                 _set_placement(plc, c.detach(), benchmark)
                 proxy = compute_proxy_cost(c, benchmark, plc)["proxy_cost"]
-                print("legalized checkpoint from step", ckpt_step, "has proxy cost", proxy)
+                print(f"legalized checkpoint from step {ckpt_step} has proxy cost {proxy}")
                 if proxy < best_valid_proxy:
                     best_valid_proxy = proxy
                     best_valid_placement = c.clone()
 
-        # fallback to final placement if no valid checkpoint found
         if best_valid_placement is None:
             best_valid_placement = placement.clone()
-            best_valid_placement = self._legalize_fast(
-                best_valid_placement, benchmark, gap=0.05, max_iters=500
-            )
+            best_valid_placement = self._legalize_fast(best_valid_placement, benchmark, gap=0.05, max_iters=500)
 
         final = best_valid_placement
         self._log_stats("final", benchmark, final, plc, wl=None, density_weight=density_weight)
@@ -465,6 +434,18 @@ class HybridAnalyticalPlacer:
                     seen.add(key)
                     nets.append(list(members))
         return nets
+    
+    # def _compute_congestion_force(self, cong_map, placement, benchmark, num_hard):
+    #     # bin indices for all macros at once
+    #     bin_x = (placement[:num_hard, 0] / self._bin_w).long().clamp(1, benchmark.grid_cols - 2)
+    #     bin_y = (placement[:num_hard, 1] / self._bin_h).long().clamp(1, benchmark.grid_rows - 2)
+        
+    #     # finite difference gradient for all macros simultaneously
+    #     dx = cong_map[bin_y, bin_x + 1] - cong_map[bin_y, bin_x - 1]
+    #     dy = cong_map[bin_y + 1, bin_x] - cong_map[bin_y - 1, bin_x]
+        
+    #     forces = torch.stack([dx, dy], dim=1)
+    #     return forces
 
     def _precompute_net_tensors(self, nets: List[List[int]]) -> Tuple[torch.Tensor, torch.Tensor]:
         max_degree = max(len(n) for n in nets)
@@ -478,11 +459,6 @@ class HybridAnalyticalPlacer:
         # upweight high fanout for congestion
         net_weights = torch.log2(degrees.clamp(min=2))
         net_weights /= net_weights.mean()
-        # uniform weights — no fanout adjustment
-        # net_weights = torch.ones(len(nets), dtype=torch.float32)
-        # Net degree weights: downweight high-fanout nets for WL
-        # net_weights = 1.0 / torch.log2(degrees.clamp(min=2))
-        # net_weights /= net_weights.mean()  # normalize so total gradient scale stays similar
         return net_indices, net_mask, net_weights
 
     def _make_initial_placement(
@@ -592,10 +568,16 @@ class HybridAnalyticalPlacer:
         return placement
 
     def _compute_density_grid_fast(
-        self, placement: torch.Tensor, benchmark: Benchmark
+        self, placement: torch.Tensor, benchmark: Benchmark,
+        inflation: float = 1.0
     ) -> torch.Tensor:
         num_macros = benchmark.num_macros
         sizes = benchmark.macro_sizes[:num_macros]
+
+        if inflation != 1.0:
+            inflated = sizes.clone()
+            inflated[:benchmark.num_hard_macros] *= inflation
+            sizes = inflated
 
         cx = placement[:num_macros, 0]
         cy = placement[:num_macros, 1]
