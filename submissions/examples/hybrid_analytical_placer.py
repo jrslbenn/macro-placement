@@ -215,11 +215,10 @@ class HybridAnalyticalPlacer:
                 plc.FLAG_UPDATE_WIRELENGTH = False
                 plc_synced_at = step
 
-        print('logging start')
         self._log_stats("start", benchmark, placement, plc, wl=None, density_weight=density_weight)
 
         start_time = time()
-        time_budget = 600
+        op_time_budget = 600
         step = 0
         
         print('starting iters')
@@ -228,9 +227,9 @@ class HybridAnalyticalPlacer:
             current_lr = base_lr * (0.5 * (1 + math.cos(math.pi * progress)))
             current_lr = max(current_lr, base_lr * 0.05)
 
-            if step % 50 == 0:
-                print(f"Step {step}/{self.num_steps} - Time elapsed: {time() - start_time:.1f}s", end="\r")
-            if time() - start_time > time_budget:
+            # if step % 50 == 0:
+            #     print(f"Step {step}/{self.num_steps} - Time elapsed: {time() - start_time:.1f}s", end="\r")
+            if time() - start_time > op_time_budget:
                 print(f"Time budget reached at step {step}")
                 break
 
@@ -283,8 +282,9 @@ class HybridAnalyticalPlacer:
             )
 
             # 6. Soft macros
+            soft_density_weight = .01
             soft_grad = wl_grad[num_hard:num_all].clone()
-            soft_grad -= 0.01 * density_forces[num_hard:num_all]
+            soft_grad -= soft_density_weight * density_forces[num_hard:num_all]
             placement[num_hard:num_all] -= self.soft_macro_lr * soft_grad
             placement[num_hard:num_all, 0].clamp_(min=hw_all[num_hard:], max=benchmark.canvas_width - hw_all[num_hard:])
             placement[num_hard:num_all, 1].clamp_(min=hh_all[num_hard:], max=benchmark.canvas_height - hh_all[num_hard:])
@@ -348,6 +348,62 @@ class HybridAnalyticalPlacer:
             best_valid_placement = placement.clone()
             best_valid_placement = self._legalize_fast(best_valid_placement, benchmark, gap=0.05, max_iters=500)
 
+        if best_valid_placement is not None and plc is not None:
+            sa_placement = best_valid_placement.clone()
+            best_wl = self._compute_wl_loss(sa_placement, net_indices, net_mask, nets, canvas_norm, net_weights=net_weights)[1].item()
+            sa_accepts = 0
+            sa_total = 0
+            sa_start = time()
+            sa_budget = 600
+
+            _set_placement(plc, sa_placement.detach(), benchmark)
+            best_sa_proxy = compute_proxy_cost(sa_placement.detach(), benchmark, plc)["proxy_cost"]
+            best_sa_placement = sa_placement.clone()
+            print(f"SA refinement starting from proxy {best_sa_proxy:.4f}, budget {sa_budget:.0f}s")
+            
+            stall_count = 0
+            for sa_step in range(100000):
+                if time() - sa_start > sa_budget:
+                    break
+
+                i = random.randint(0, num_hard - 1)
+                j = random.randint(0, num_hard - 1)
+                if i == j or fixed[i] or fixed[j]:
+                    continue
+
+                sa_total += 1
+                sa_placement[i], sa_placement[j] = sa_placement[j].clone(), sa_placement[i].clone()
+
+                if self._swap_creates_overlap(sa_placement, benchmark, i, j):
+                    sa_placement[i], sa_placement[j] = sa_placement[j].clone(), sa_placement[i].clone()
+                    continue
+
+                new_wl = self._compute_wl_loss(sa_placement, net_indices, net_mask, nets, canvas_norm, net_weights=net_weights)[1].item()
+
+                if new_wl < best_wl:
+                    best_wl = new_wl
+                    sa_accepts += 1
+                else:
+                    sa_placement[i], sa_placement[j] = sa_placement[j].clone(), sa_placement[i].clone()
+
+                if sa_total % 200 == 0:
+                    _set_placement(plc, sa_placement.detach(), benchmark)
+                    sa_proxy = compute_proxy_cost(sa_placement.detach(), benchmark, plc)["proxy_cost"]
+                    elapsed = time() - sa_start
+                    print(f"  SA step {sa_total}: wl={best_wl:.4f} proxy={sa_proxy:.4f} accepts={sa_accepts} [{elapsed:.0f}s]")
+                    if sa_proxy < best_sa_proxy:
+                        best_sa_proxy = sa_proxy
+                        best_sa_placement = sa_placement.clone()
+                        stall_count = 0
+                    else:
+                        stall_count += 1
+                        if stall_count > 3:
+                            print("SA Stalled, breaking")
+                            break
+
+            print(f"SA finished: {sa_total} attempts, {sa_accepts} accepts, best proxy {best_sa_proxy:.4f}")
+            best_valid_placement = best_sa_placement
+
         final = best_valid_placement
         self._log_stats("final", benchmark, final, plc, wl=None, density_weight=density_weight)
         # pr.disable()
@@ -373,6 +429,21 @@ class HybridAnalyticalPlacer:
         penalty = (overlap_x * overlap_y * self._leg_tri).sum()
 
         return penalty / (num_hard**2)  # normalize by macro count
+
+    def _swap_creates_overlap(self, placement, benchmark, i, j):
+        """Check only if macros i and j overlap with others after swap"""
+        num_hard = benchmark.num_hard_macros
+        for idx in [i, j]:
+            for k in range(num_hard):
+                if k == i or k == j:
+                    continue
+                dx = abs(placement[idx, 0] - placement[k, 0]).item()
+                dy = abs(placement[idx, 1] - placement[k, 1]).item()
+                sx = self._leg_sep_x_base[idx, k].item()
+                sy = self._leg_sep_y_base[idx, k].item()
+                if dx < sx and dy < sy:
+                    return True
+        return False
 
     def _load_plc_for_logging(self, benchmark: Benchmark):
         try:
