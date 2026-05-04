@@ -78,7 +78,7 @@ def strong_legalize(placement, benchmark, gap=0.021, max_iters=200):
         force_y = (sign_y * push_amount_y).sum(dim=1) - (sign_y * push_amount_y).sum(dim=0)
 
         num_overlaps = overlap.sum().float()
-        damping = min(1.0, 2.0 / (num_overlaps.item() ** 0.5 + 1))
+        damping = min(1.0, 1 / (num_overlaps.item() ** 0.5 + 1))
         placement[:num_hard, 0] += force_x * damping
         placement[:num_hard, 1] += force_y * damping
 
@@ -116,6 +116,182 @@ def strong_legalize(placement, benchmark, gap=0.021, max_iters=200):
 
     return placement
 
+
+@njit
+def _update_density_incr(
+    grid,
+    old_cx,
+    old_cy,
+    new_cx,
+    new_cy,
+    hw,
+    hh,
+    bl,
+    br,
+    bb,
+    bt,
+    bin_area,
+    n_rows,
+    n_cols,
+    bin_w,
+    bin_h,
+):
+    left = old_cx - hw
+    right = old_cx + hw
+    bottom = old_cy - hh
+    top = old_cy + hh
+    c0 = max(0, int(left / bin_w))
+    c1 = min(n_cols - 1, int(right / bin_w))
+    r0 = max(0, int(bottom / bin_h))
+    r1 = min(n_rows - 1, int(top / bin_h))
+    for r in range(r0, r1 + 1):
+        for c in range(c0, c1 + 1):
+            ox = min(right, br[c]) - max(left, bl[c])
+            oy = min(top, bt[r]) - max(bottom, bb[r])
+            if ox > 0 and oy > 0:
+                grid[r, c] -= ox * oy / bin_area
+    left = new_cx - hw
+    right = new_cx + hw
+    bottom = new_cy - hh
+    top = new_cy + hh
+    c0 = max(0, int(left / bin_w))
+    c1 = min(n_cols - 1, int(right / bin_w))
+    r0 = max(0, int(bottom / bin_h))
+    r1 = min(n_rows - 1, int(top / bin_h))
+    for r in range(r0, r1 + 1):
+        for c in range(c0, c1 + 1):
+            ox = min(right, br[c]) - max(left, bl[c])
+            oy = min(top, bt[r]) - max(bottom, bb[r])
+            if ox > 0 and oy > 0:
+                grid[r, c] += ox * oy / bin_area
+
+@njit
+def _update_rudy_incr_single(rudy_grid, ni_np, nm_np, pos, affected_nets,
+                              macro_i, old_x, old_y, bin_w, bin_h, n_rows, n_cols):
+    """Update RUDY grid for single macro displacement."""
+    for k in range(len(affected_nets)):
+        n = affected_nets[k]
+        xmin_old = np.float32(1e18)
+        xmax_old = np.float32(-1e18)
+        ymin_old = np.float32(1e18)
+        ymax_old = np.float32(-1e18)
+        xmin_new = np.float32(1e18)
+        xmax_new = np.float32(-1e18)
+        ymin_new = np.float32(1e18)
+        ymax_new = np.float32(-1e18)
+
+        for d in range(ni_np.shape[1]):
+            if not nm_np[n, d]:
+                break
+            idx = ni_np[n, d]
+            nx = pos[idx, 0]
+            ny = pos[idx, 1]
+            if nx < xmin_new: xmin_new = nx
+            if nx > xmax_new: xmax_new = nx
+            if ny < ymin_new: ymin_new = ny
+            if ny > ymax_new: ymax_new = ny
+
+            if idx == macro_i:
+                ox, oy = old_x, old_y
+            else:
+                ox, oy = nx, ny
+            if ox < xmin_old: xmin_old = ox
+            if ox > xmax_old: xmax_old = ox
+            if oy < ymin_old: ymin_old = oy
+            if oy > ymax_old: ymax_old = oy
+
+        old_area = (xmax_old - xmin_old + 1e-6) * (ymax_old - ymin_old + 1e-6)
+        old_demand = min(np.float32(1.0) / old_area, np.float32(100.0))
+        c0 = max(0, int(xmin_old / bin_w))
+        c1 = min(n_cols - 1, int(xmax_old / bin_w))
+        r0 = max(0, int(ymin_old / bin_h))
+        r1 = min(n_rows - 1, int(ymax_old / bin_h))
+        for r in range(r0, r1 + 1):
+            for c in range(c0, c1 + 1):
+                rudy_grid[r, c] -= old_demand
+
+        new_area = (xmax_new - xmin_new + 1e-6) * (ymax_new - ymin_new + 1e-6)
+        new_demand = min(np.float32(1.0) / new_area, np.float32(100.0))
+        c0 = max(0, int(xmin_new / bin_w))
+        c1 = min(n_cols - 1, int(xmax_new / bin_w))
+        r0 = max(0, int(ymin_new / bin_h))
+        r1 = min(n_rows - 1, int(ymax_new / bin_h))
+        for r in range(r0, r1 + 1):
+            for c in range(c0, c1 + 1):
+                rudy_grid[r, c] += new_demand
+
+@njit
+def _density_cost_top5(grid):
+    flat = grid.flatten()
+    n = len(flat)
+    k = max(1, int(n * 0.05))
+    idx = np.argpartition(flat, -k)[-k:]
+    return flat[idx].mean()
+
+
+@njit
+def _congestion_cost_top5(grid):
+    flat = grid.flatten()
+    n = len(flat)
+    k = max(1, int(n * 0.05))
+    idx = np.argpartition(flat, -k)[-k:]
+    return flat[idx].mean()
+
+
+@njit
+def _build_density_grid(
+    grid, pos, sizes, num_all, bl, br, bb, bt, bin_area, n_rows, n_cols, bin_w, bin_h
+):
+    for m in range(num_all):
+        cx, cy = pos[m, 0], pos[m, 1]
+        hw, hh = sizes[m, 0] / 2, sizes[m, 1] / 2
+        left = cx - hw
+        right = cx + hw
+        bottom = cy - hh
+        top = cy + hh
+        c0 = max(0, int(left / bin_w))
+        c1 = min(n_cols - 1, int(right / bin_w))
+        r0 = max(0, int(bottom / bin_h))
+        r1 = min(n_rows - 1, int(top / bin_h))
+        for r in range(r0, r1 + 1):
+            for c in range(c0, c1 + 1):
+                ox = min(right, br[c]) - max(left, bl[c])
+                oy = min(top, bt[r]) - max(bottom, bb[r])
+                if ox > 0 and oy > 0:
+                    grid[r, c] += ox * oy / bin_area
+
+
+@njit
+def _build_rudy_grid(grid, ni_np, nm_np, pos, num_nets, bin_w, bin_h, n_rows, n_cols):
+    for n in range(num_nets):
+        xmin = np.float32(1e18)
+        xmax = np.float32(-1e18)
+        ymin = np.float32(1e18)
+        ymax = np.float32(-1e18)
+        for d in range(ni_np.shape[1]):
+            if not nm_np[n, d]:
+                break
+            idx = ni_np[n, d]
+            x, y = pos[idx, 0], pos[idx, 1]
+            if x < xmin:
+                xmin = x
+            if x > xmax:
+                xmax = x
+            if y < ymin:
+                ymin = y
+            if y > ymax:
+                ymax = y
+        area = (xmax - xmin + 1e-6) * (ymax - ymin + 1e-6)
+        demand = min(np.float32(1.0) / area, np.float32(100.0))
+        c0 = max(0, int(xmin / bin_w))
+        c1 = min(n_cols - 1, int(xmax / bin_w))
+        r0 = max(0, int(ymin / bin_h))
+        r1 = min(n_rows - 1, int(ymax / bin_h))
+        for r in range(r0, r1 + 1):
+            for c in range(c0, c1 + 1):
+                grid[r, c] += demand
+
+
 @njit
 def _swap_creates_overlap(placement_np, i, j, sep_x_np, sep_y_np, num_hard):
     for idx in [i, j]:
@@ -127,6 +303,7 @@ def _swap_creates_overlap(placement_np, i, j, sep_x_np, sep_y_np, num_hard):
             if dx < sep_x_np[idx, k] and dy < sep_y_np[idx, k]:
                 return True
     return False
+
 
 @njit
 def _hpwl_batch(net_idxs, ni_np, nm_np, pos):
@@ -144,12 +321,102 @@ def _hpwl_batch(net_idxs, ni_np, nm_np, pos):
             idx = ni_np[n, d]
             x = pos[idx, 0]
             y = pos[idx, 1]
-            if x < xmin: xmin = x
-            if x > xmax: xmax = x
-            if y < ymin: ymin = y
-            if y > ymax: ymax = y
+            if x < xmin:
+                xmin = x
+            if x > xmax:
+                xmax = x
+            if y < ymin:
+                ymin = y
+            if y > ymax:
+                ymax = y
         result[k] = (xmax - xmin) + (ymax - ymin)
     return result
+
+
+def spectral_init_placement(
+    placement: torch.Tensor,
+    benchmark,
+    nets,
+    blend: float = 0.7,
+    max_net_size: int = 20,
+) -> torch.Tensor:
+    """
+    Spectral initialization for macro placement.
+
+    Args:
+        placement: (N, 2) tensor
+        benchmark: object with:
+            - num_hard_macros
+            - macro_fixed
+            - canvas_width
+            - canvas_height
+        nets: List[List[int]] (macro connectivity)
+        blend: how much to trust spectral coords (0.7 = strong)
+        max_net_size: ignore huge nets (noise)
+
+    Returns:
+        Updated placement tensor
+    """
+    placement = placement.clone()
+    device = placement.device
+
+    num_hard = benchmark.num_hard_macros
+    movable = ~benchmark.macro_fixed[:num_hard]
+    movable_indices = torch.where(movable)[0]
+
+    # --- Build adjacency ---
+    A = torch.zeros((num_hard, num_hard), dtype=torch.float32)
+
+    for net in nets:
+        if len(net) < 2 or len(net) > max_net_size:
+            continue
+
+        w = 1.0 / (len(net) - 1)
+
+        for i in range(len(net)):
+            u = net[i]
+            if u >= num_hard:
+                continue
+            for j in range(i + 1, len(net)):
+                v = net[j]
+                if v >= num_hard:
+                    continue
+                A[u, v] += w
+                A[v, u] += w
+
+    # --- Laplacian ---
+    D = torch.diag(A.sum(dim=1))
+    L = D - A
+
+    # --- Eigen decomposition (CPU for stability) ---
+    L_np = L.cpu().numpy()
+    eigvals, eigvecs = np.linalg.eigh(L_np)
+
+    # skip first eigenvector (constant)
+    coords = torch.tensor(eigvecs[:, 1:3], dtype=torch.float32)
+
+    # --- Add small noise to avoid collapse ---
+    coords += 0.01 * torch.randn_like(coords)
+
+    # --- Normalize to [0, 1] ---
+    for d in range(2):
+        min_v = coords[:, d].min()
+        max_v = coords[:, d].max()
+        coords[:, d] = (coords[:, d] - min_v) / (max_v - min_v + 1e-8)
+
+    # --- Scale to canvas ---
+    coords[:, 0] *= benchmark.canvas_width
+    coords[:, 1] *= benchmark.canvas_height
+
+    coords = coords.to(device)
+
+    # --- Blend into placement (only movable macros) ---
+    placement[movable_indices] = (
+        (1 - blend) * placement[movable_indices]
+        + blend * coords[movable_indices]
+    )
+
+    return placement
 
 class HybridAnalyticalPlacer:
     def __init__(
@@ -186,7 +453,7 @@ class HybridAnalyticalPlacer:
             return placement
 
         net_indices, net_mask, net_weights = self._precompute_net_tensors(nets)
-        placement = self._make_initial_placement(placement, benchmark, nets, net_indices, net_mask)
+        # placement = self._make_initial_placement(placement, benchmark, nets, net_indices, net_mask)
 
         hard_sizes = benchmark.macro_sizes[:num_hard]
         hw_hard = hard_sizes[:, 0] / 2
@@ -217,7 +484,9 @@ class HybridAnalyticalPlacer:
         # ── Initial legalization ──
         placement = self._legalize_fast(placement, benchmark, gap=0.02, max_iters=400)
         overlaps = self._hard_overlap_count(placement, benchmark)
-        print(f"Initial placement has {overlaps} overlaps among {num_hard} macros after fast legalization")
+        print(
+            f"Initial placement has {overlaps} overlaps among {num_hard} macros after fast legalization"
+        )
         if overlaps > num_hard // 3:
             print(f"fast legal failed, applying strong legalization to fix {overlaps}")
             placement = strong_legalize(placement, benchmark, gap=0.02, max_iters=40)
@@ -251,10 +520,11 @@ class HybridAnalyticalPlacer:
         self._log_stats("start", benchmark, placement, plc, wl=None, density_weight=density_weight)
 
         start_time = time()
-        op_time_budget = 300
+        op_time_budget = 600
         step = 0
         track_proxies = []
-        print('starting iters')
+        print("starting iters")
+        target_grid = None
         for step in range(self.num_steps):
             progress = step / self.num_steps
             current_lr = base_lr * (0.5 * (1 + math.cos(math.pi * progress)))
@@ -286,7 +556,6 @@ class HybridAnalyticalPlacer:
             lookahead.requires_grad_(False)
 
             grid = self._compute_density_grid_fast(placement, benchmark)
-            target_grid = None
             if step % 500 == 0:
                 rudy = self._compute_rudy_map(placement, benchmark, nets, net_indices, net_mask)
                 # Lower density target where congestion is high
@@ -316,16 +585,22 @@ class HybridAnalyticalPlacer:
             velocity[:num_hard] = self.momentum * velocity[:num_hard] - current_lr * hard_grad
             placement[:num_hard] = (placement[:num_hard] + velocity[:num_hard]).clamp(
                 min=torch.stack([hw_hard, hh_hard], dim=1),
-                max=torch.stack([benchmark.canvas_width - hw_hard, benchmark.canvas_height - hh_hard], dim=1),
+                max=torch.stack(
+                    [benchmark.canvas_width - hw_hard, benchmark.canvas_height - hh_hard], dim=1
+                ),
             )
 
             # 6. Soft macros
-            soft_density_weight = .01
+            soft_density_weight = 0.01
             soft_grad = wl_grad[num_hard:num_all].clone()
             soft_grad -= soft_density_weight * density_forces[num_hard:num_all]
             placement[num_hard:num_all] -= self.soft_macro_lr * soft_grad
-            placement[num_hard:num_all, 0].clamp_(min=hw_all[num_hard:], max=benchmark.canvas_width - hw_all[num_hard:])
-            placement[num_hard:num_all, 1].clamp_(min=hh_all[num_hard:], max=benchmark.canvas_height - hh_all[num_hard:])
+            placement[num_hard:num_all, 0].clamp_(
+                min=hw_all[num_hard:], max=benchmark.canvas_width - hw_all[num_hard:]
+            )
+            placement[num_hard:num_all, 1].clamp_(
+                min=hh_all[num_hard:], max=benchmark.canvas_height - hh_all[num_hard:]
+            )
 
             if fixed.any():
                 placement[fixed] = benchmark.macro_positions[fixed]
@@ -343,7 +618,9 @@ class HybridAnalyticalPlacer:
                 top_k_candidates.sort(key=lambda x: x[0])
                 top_k_candidates = top_k_candidates[:K]
                 track_proxies.append(float(proxy_est))
-                if len(track_proxies) >= 4 and all(p > track_proxies[-4] for p in track_proxies[-3:]):
+                if len(track_proxies) >= 6 and all(
+                    p > track_proxies[-6] for p in track_proxies[-5:]
+                ):
                     print(f"Proxy diverging, stopping early at step {step}")
                     break
 
@@ -357,11 +634,16 @@ class HybridAnalyticalPlacer:
                     metrics = None
                     proxy_est = wl.item()
                 self._log_stats(
-                    f"step_{step+1}", benchmark, placement, plc,
-                    wl=wl.item(), density_weight=density_weight, metrics=metrics,
+                    f"step_{step+1}",
+                    benchmark,
+                    placement,
+                    plc,
+                    wl=wl.item(),
+                    density_weight=density_weight,
+                    metrics=metrics,
                 )
                 recent_proxies.append(float(proxy_est))
-                
+
             placement = placement.detach()
 
         # ── Post-optimization: legalize top-k and pick best ──
@@ -375,9 +657,13 @@ class HybridAnalyticalPlacer:
                     break
                 c = self._legalize_fast(c, benchmark, gap=0.01 * (i + 1), max_iters=200)
             if self._hard_overlap_count(c, benchmark) > 0:
-                print("attempting strong legalize")
-                c = strong_legalize(c, benchmark, gap=0.01, max_iters=40)
-                print(f"strong legalize finished: {self._hard_overlap_count(c, benchmark)}")
+                if time() - start_time < 600:
+                    print("attempting strong legalize")
+                    c = strong_legalize(c, benchmark, gap=0.01, max_iters=40)
+                    print(f"strong legalize finished: {self._hard_overlap_count(c, benchmark)}")
+                else:
+                    print("strong legalize took too long, continuing")
+                    continue
             if self._hard_overlap_count(c, benchmark) == 0:
                 _set_placement(plc, c.detach(), benchmark)
                 proxy = compute_proxy_cost(c, benchmark, plc)["proxy_cost"]
@@ -388,18 +674,72 @@ class HybridAnalyticalPlacer:
 
         if best_valid_placement is None:
             best_valid_placement = placement.clone()
-            best_valid_placement = self._legalize_fast(best_valid_placement, benchmark, gap=0.05, max_iters=500)
+            best_valid_placement = self._legalize_fast(
+                best_valid_placement, benchmark, gap=0.05, max_iters=500
+            )
 
         if best_valid_placement is not None and plc is not None:
             best_valid_placement = self._sa_refine(
-                best_valid_placement, benchmark, plc,
-                net_indices, net_mask, net_weights,
-                canvas_norm, num_hard, num_all, fixed,
-                self._leg_sep_x_base.numpy().copy(), self._leg_sep_y_base.numpy().copy(),
-                budget=300, checkpoint_every=200
+                best_valid_placement,
+                benchmark,
+                plc,
+                net_indices,
+                net_mask,
+                net_weights,
+                canvas_norm,
+                num_hard,
+                num_all,
+                fixed,
+                self._leg_sep_x_base.numpy().copy(),
+                self._leg_sep_y_base.numpy().copy(),
+                budget=400,
+                checkpoint_every=200,
+            )
+
+            best_valid_placement = self._sa_refine_displace(
+                best_valid_placement,
+                benchmark,
+                plc,
+                net_indices,
+                net_mask,
+                net_weights,
+                canvas_norm,
+                num_hard,
+                num_all,
+                fixed,
+                self._leg_sep_x_base.numpy().copy(),
+                self._leg_sep_y_base.numpy().copy(),
+                budget=400,
+                checkpoint_every=200,
+            )
+
+            # best_valid_placement = self._cd_refine(
+            #     best_valid_placement, benchmark, plc,
+            #     net_indices, net_mask, num_hard, num_all, fixed,
+            #     budget=180,
+            # )
+
+
+        # Re-settle soft macros after SA
+        if best_valid_placement is not None:
+            best_valid_placement = self._settle_soft_macros(
+                best_valid_placement,
+                net_indices,
+                net_mask,
+                nets,
+                benchmark,
+                num_hard,
+                steps=80,
+                lr=0.1,
             )
 
         final = best_valid_placement
+
+        # Emergency legalize safety check
+        if self._hard_overlap_count(final, benchmark) > 0:
+            print("WARNING: final has overlaps, emergency legalize")
+            final = strong_legalize(final, benchmark, gap=0.05, max_iters=200)
+
         self._log_stats("final", benchmark, final, plc, wl=None, density_weight=density_weight)
         # pr.disable()
         # s = io.StringIO()
@@ -416,21 +756,330 @@ class HybridAnalyticalPlacer:
             ys = pos[members, 1]
             x_min, x_max = xs.min(), xs.max()
             y_min, y_max = ys.min(), ys.max()
-            
+
             # Grid bins covered by this net's bbox
             col_lo = max(0, int(x_min / self._bin_w))
             col_hi = min(benchmark.grid_cols - 1, int(x_max / self._bin_w))
             row_lo = max(0, int(y_min / self._bin_h))
             row_hi = min(benchmark.grid_rows - 1, int(y_max / self._bin_h))
-            
+
             area = (x_max - x_min + 1e-6) * (y_max - y_min + 1e-6)
             demand = 1.0 / area
-            rudy[row_lo:row_hi+1, col_lo:col_hi+1] += demand
-        
+            rudy[row_lo : row_hi + 1, col_lo : col_hi + 1] += demand
+
         return rudy
 
-    def _sa_refine(self, placement, benchmark, plc, net_indices, net_mask, net_weights,
-                canvas_norm, num_hard, num_all, fixed, sep_x_np, sep_y_np, budget=600, checkpoint_every=200):
+    def _sa_refine_displace(
+            self,
+            placement,
+            benchmark,
+            plc,
+            net_indices,
+            net_mask,
+            net_weights,
+            canvas_norm,
+            num_hard,
+            num_all,
+            fixed,
+            sep_x_np,
+            sep_y_np,
+            budget=600,
+            checkpoint_every=200,
+        ):
+            """SA refinement using single-macro displacements with incremental proxy."""
+            sa_placement = placement.clone()
+            sa_pos, macro_to_nets, net_hpwl, eval_delta, total_wl = self._build_incremental_wl(
+                net_indices, net_mask, net_weights, sa_placement, num_all, canvas_norm
+            )
+
+            ni_np = net_indices.numpy().copy()
+            nm_np = net_mask.numpy().copy()
+            num_nets = ni_np.shape[0]
+            sizes_np = benchmark.macro_sizes[:num_all].numpy().copy()
+            hw_np = sizes_np[:, 0] / 2
+            hh_np = sizes_np[:, 1] / 2
+
+            bl = self._bin_left.numpy().copy()
+            br = self._bin_right.numpy().copy()
+            bb = self._bin_bottom.numpy().copy()
+            bt = self._bin_top.numpy().copy()
+            bin_w = float(self._bin_w)
+            bin_h = float(self._bin_h)
+            bin_area = bin_w * bin_h
+            n_rows = benchmark.grid_rows
+            n_cols = benchmark.grid_cols
+
+            density_grid = np.zeros((n_rows, n_cols), dtype=np.float32)
+            _build_density_grid(density_grid, sa_pos, sizes_np, num_all, bl, br, bb, bt, bin_area, n_rows, n_cols, bin_w, bin_h)
+
+            rudy_grid = np.zeros((n_rows, n_cols), dtype=np.float32)
+            _build_rudy_grid(rudy_grid, ni_np, nm_np, sa_pos, num_nets, bin_w, bin_h, n_rows, n_cols)
+
+            current_den = _density_cost_top5(density_grid)
+            current_cong = _congestion_cost_top5(rudy_grid)
+
+            # Calibrate fast proxy to match real proxy scale
+            _set_placement(plc, sa_placement.detach(), benchmark)
+            real_metrics = compute_proxy_cost(sa_placement.detach(), benchmark, plc)
+            best_proxy = real_metrics["proxy_cost"]
+            den_scale = real_metrics['density_cost'] / (current_den + 1e-8)
+            cong_scale = real_metrics['congestion_cost'] / (current_cong + 1e-8)
+
+            # Use scaled values for current_proxy
+            current_proxy = total_wl + 0.5 * (current_den * den_scale) + .5 * (current_cong * cong_scale)
+
+            best_placement = sa_placement.clone()
+            print(f"SA displace start: real={best_proxy:.4f} fast={current_proxy:.4f} wl={total_wl:.4f} den_scale={den_scale:.4f} cong_scale={cong_scale:.4f}")
+
+            accepts = total = stalls = 0
+            last_accept_step = 0
+            t0 = time()
+            max_displacement = canvas_norm * 0.03
+
+            for _ in range(100_000_000):
+                if time() - t0 > budget:
+                    break
+
+                if accepts > 0 and accepts % 500 == 0 and accepts % checkpoint_every != 0:
+                    density_grid[:] = 0
+                    _build_density_grid(density_grid, sa_pos, sizes_np, num_all, bl, br, bb, bt, bin_area, n_rows, n_cols, bin_w, bin_h)
+                    rudy_grid[:] = 0
+                    _build_rudy_grid(rudy_grid, ni_np, nm_np, sa_pos, num_nets, bin_w, bin_h, n_rows, n_cols)
+                    current_den = _density_cost_top5(density_grid)
+                    current_cong = _congestion_cost_top5(rudy_grid)
+                    current_proxy = total_wl + 0.5 * (current_den * den_scale) + .5 * (current_cong * cong_scale)
+
+                if total % 100000 == 0 and total > 0:
+                    print(f"  step={total} accepts={accepts} wl={total_wl:.4f} fast={current_proxy:.4f} [{time()-t0:.0f}s]", end="\r")
+
+                i = random.randint(0, num_hard - 1)
+                if fixed[i].item():
+                    continue
+
+                total += 1
+
+                old_x = float(sa_pos[i, 0])
+                old_y = float(sa_pos[i, 1])
+
+                dx = random.uniform(-max_displacement, max_displacement)
+                dy = random.uniform(-max_displacement, max_displacement)
+                sa_pos[i, 0] = np.clip(old_x + dx, hw_np[i], benchmark.canvas_width - hw_np[i])
+                sa_pos[i, 1] = np.clip(old_y + dy, hh_np[i], benchmark.canvas_height - hh_np[i])
+
+                has_overlap = False
+                for k in range(num_hard):
+                    if k == i:
+                        continue
+                    if (abs(sa_pos[i, 0] - sa_pos[k, 0]) < sep_x_np[i, k] and
+                        abs(sa_pos[i, 1] - sa_pos[k, 1]) < sep_y_np[i, k]):
+                        has_overlap = True
+                        break
+
+                if has_overlap:
+                    sa_pos[i, 0] = old_x
+                    sa_pos[i, 1] = old_y
+                    continue
+
+                aff = macro_to_nets[i]
+                if len(aff) == 0:
+                    sa_pos[i, 0] = old_x
+                    sa_pos[i, 1] = old_y
+                    continue
+
+                old_hpwl = net_hpwl[aff].copy()
+                new_hpwl = _hpwl_batch(aff, ni_np, nm_np, sa_pos)
+                wl_delta = float((new_hpwl - old_hpwl).sum()) / (num_nets * canvas_norm)
+
+                new_x = float(sa_pos[i, 0])
+                new_y = float(sa_pos[i, 1])
+                _update_density_incr(density_grid, old_x, old_y, new_x, new_y,
+                                    hw_np[i], hh_np[i], bl, br, bb, bt, bin_area, n_rows, n_cols, bin_w, bin_h)
+                new_den = _density_cost_top5(density_grid)
+
+                _update_rudy_incr_single(rudy_grid, ni_np, nm_np, sa_pos, aff, i, old_x, old_y, bin_w, bin_h, n_rows, n_cols)
+                new_cong = _congestion_cost_top5(rudy_grid)
+
+                new_proxy = (total_wl + wl_delta) + 0.5 * (new_den * den_scale) + .5 * (new_cong * cong_scale)
+
+                if new_proxy < current_proxy:
+                    sa_placement[i, 0] = float(sa_pos[i, 0])
+                    sa_placement[i, 1] = float(sa_pos[i, 1])
+                    net_hpwl[aff] = new_hpwl
+                    total_wl += wl_delta
+                    current_proxy = new_proxy
+                    current_den = new_den
+                    current_cong = new_cong
+                    accepts += 1
+                    last_accept_step = total
+
+                    if accepts % checkpoint_every == 0:
+                        _set_placement(plc, sa_placement.detach(), benchmark)
+                        real_proxy = compute_proxy_cost(sa_placement.detach(), benchmark, plc)["proxy_cost"]
+                        print(f"  step={total} accepts={accepts} wl={total_wl:.4f} fast={current_proxy:.4f} real={real_proxy:.4f} [{time()-t0:.0f}s]")
+                        if real_proxy < best_proxy:
+                            best_proxy = real_proxy
+                            best_placement = sa_placement.clone()
+                            stalls = 0
+                        else:
+                            sa_placement = best_placement.clone()
+                            sa_pos[:] = best_placement.detach().numpy()
+                            net_hpwl[:] = _hpwl_batch(np.arange(num_nets, dtype=np.int32), ni_np, nm_np, sa_pos)
+                            total_wl = float(net_hpwl.sum()) / (num_nets * canvas_norm)
+                            density_grid[:] = 0
+                            _build_density_grid(density_grid, sa_pos, sizes_np, num_all, bl, br, bb, bt, bin_area, n_rows, n_cols, bin_w, bin_h)
+                            rudy_grid[:] = 0
+                            _build_rudy_grid(rudy_grid, ni_np, nm_np, sa_pos, num_nets, bin_w, bin_h, n_rows, n_cols)
+                            current_den = _density_cost_top5(density_grid)
+                            current_cong = _congestion_cost_top5(rudy_grid)
+                            current_proxy = total_wl + 0.5 * (current_den * den_scale) + .5 * (current_cong * cong_scale)
+                            stalls += 1
+                            if stalls >= 6:
+                                print("SA displace stalled")
+                                break
+                else:
+                    new_x = float(sa_pos[i, 0])
+                    new_y = float(sa_pos[i, 1])
+                    sa_pos[i, 0] = old_x
+                    sa_pos[i, 1] = old_y
+                    _update_density_incr(density_grid, new_x, new_y, old_x, old_y,
+                                        hw_np[i], hh_np[i], bl, br, bb, bt, bin_area, n_rows, n_cols, bin_w, bin_h)
+                    _update_rudy_incr_single(rudy_grid, ni_np, nm_np, sa_pos, aff, i, new_x, new_y, bin_w, bin_h, n_rows, n_cols)
+
+                if total - last_accept_step > 5_000_000:
+                    print(f"SA displace: no accepts in 5M attempts, stopping")
+                    break
+
+            print(f"SA displace done: {total} attempts, {accepts} accepts, best real_proxy={best_proxy:.4f}")
+            return best_placement
+  
+    def _cd_refine(self, placement, benchmark, plc, net_indices, net_mask,
+               num_hard, num_all, fixed, budget=180):
+        """
+        Coordinate descent refinement using real density + congestion costs.
+        For each macro, try positions along x and y axes, keep best.
+        """
+        placement = placement.clone()
+        canvas_norm = benchmark.canvas_width + benchmark.canvas_height
+        sizes = benchmark.macro_sizes[:num_hard]
+        hw = sizes[:, 0] / 2
+        hh = sizes[:, 1] / 2
+        sep_x = self._leg_sep_x_base
+        sep_y = self._leg_sep_y_base
+
+        _set_placement(plc, placement.detach(), benchmark)
+        best_proxy = compute_proxy_cost(placement.detach(), benchmark, plc)["proxy_cost"]
+        best_placement = placement.clone()
+        print(f"CD start: proxy={best_proxy:.4f}")
+
+        t0 = time()
+        sweep = 0
+        total_improved = 0
+        n_positions = 8  # positions to try per axis
+
+        while time() - t0 < budget:
+            sweep += 1
+            sweep_improved = 0
+            order = list(range(num_hard))
+            random.shuffle(order)
+
+            for macro_idx in order:
+                if time() - t0 > budget:
+                    break
+                if fixed[macro_idx].item():
+                    continue
+
+                orig_x = float(placement[macro_idx, 0])
+                orig_y = float(placement[macro_idx, 1])
+                best_x = orig_x
+                best_y = orig_y
+                best_cost = best_proxy
+
+                # Generate candidate positions along x and y
+                x_min = float(hw[macro_idx])
+                x_max = float(benchmark.canvas_width - hw[macro_idx])
+                y_min = float(hh[macro_idx])
+                y_max = float(benchmark.canvas_height - hh[macro_idx])
+
+                # Spread around current position
+                spread_x = (x_max - x_min) * 0.1
+                spread_y = (y_max - y_min) * 0.1
+
+                candidates = []
+                for dx in np.linspace(-spread_x, spread_x, n_positions):
+                    cx = np.clip(orig_x + dx, x_min, x_max)
+                    candidates.append((cx, orig_y))
+                for dy in np.linspace(-spread_y, spread_y, n_positions):
+                    cy = np.clip(orig_y + dy, y_min, y_max)
+                    candidates.append((orig_x, cy))
+
+                for cx, cy in candidates:
+                    if cx == orig_x and cy == orig_y:
+                        continue
+
+                    # Check overlaps
+                    placement[macro_idx, 0] = cx
+                    placement[macro_idx, 1] = cy
+                    has_overlap = False
+                    for k in range(num_hard):
+                        if k == macro_idx:
+                            continue
+                        if (abs(cx - float(placement[k, 0])) < float(sep_x[macro_idx, k]) and
+                            abs(cy - float(placement[k, 1])) < float(sep_y[macro_idx, k])):
+                            has_overlap = True
+                            break
+
+                    if has_overlap:
+                        continue
+
+                    # Evaluate with real costs
+                    _set_placement(plc, placement.detach(), benchmark)
+                    den = plc.get_density_cost()
+                    cong = plc.get_congestion_cost()
+                    wl_metrics = compute_proxy_cost(placement.detach(), benchmark, plc)
+                    cost = wl_metrics["proxy_cost"]
+
+                    if cost < best_cost:
+                        best_cost = cost
+                        best_x = cx
+                        best_y = cy
+
+                # Apply best position
+                placement[macro_idx, 0] = best_x
+                placement[macro_idx, 1] = best_y
+
+                if best_cost < best_proxy:
+                    best_proxy = best_cost
+                    best_placement = placement.clone()
+                    sweep_improved += 1
+                    total_improved += 1
+
+            elapsed = time() - t0
+            print(f"  CD sweep {sweep}: proxy={best_proxy:.4f} improved={sweep_improved} total={total_improved} [{elapsed:.0f}s]")
+
+            if sweep_improved == 0:
+                print("CD: no improvement this sweep, stopping")
+                break
+
+        print(f"CD done: {sweep} sweeps, {total_improved} improvements, proxy={best_proxy:.4f}")
+        return best_placement
+
+    def _sa_refine(
+        self,
+        placement,
+        benchmark,
+        plc,
+        net_indices,
+        net_mask,
+        net_weights,
+        canvas_norm,
+        num_hard,
+        num_all,
+        fixed,
+        sep_x_np,
+        sep_y_np,
+        budget=600,
+        checkpoint_every=200,
+    ):
         """
         SA refinement with incremental WL evaluation and checkpoint revert.
         Returns best placement found.
@@ -456,7 +1105,10 @@ class HybridAnalyticalPlacer:
             if time() - t0 > budget:
                 break
             if total % 100000 == 0:
-                print(f"  step={total} accepts={accepts} wl={total_wl:.4f} [{time()-t0:.0f}s]", end="\r")
+                print(
+                    f"  step={total} accepts={accepts} wl={total_wl:.4f} [{time()-t0:.0f}s]",
+                    end="\r",
+                )
             i = random.randint(0, num_hard - 1)
             j = random.randint(0, num_hard - 1)
             if i == j or fixed[i].item() or fixed[j].item():
@@ -481,7 +1133,9 @@ class HybridAnalyticalPlacer:
                 if accepts % checkpoint_every == 0:
                     _set_placement(plc, sa_placement.detach(), benchmark)
                     proxy = compute_proxy_cost(sa_placement.detach(), benchmark, plc)["proxy_cost"]
-                    print(f"  step={total} accepts={accepts} wl={total_wl:.4f} proxy={proxy:.4f} [{time()-t0:.0f}s]")
+                    print(
+                        f"  step={total} accepts={accepts} wl={total_wl:.4f} proxy={proxy:.4f} [{time()-t0:.0f}s]"
+                    )
                     if proxy < best_proxy:
                         best_proxy = proxy
                         best_placement = sa_placement.clone()
@@ -495,7 +1149,7 @@ class HybridAnalyticalPlacer:
                         )
                         total_wl = float(net_hpwl.sum()) / (num_nets * canvas_norm)
                         stalls += 1
-                        if stalls >= 5:
+                        if stalls >= 4:
                             print("SA stalled")
                             break
 
@@ -508,7 +1162,9 @@ class HybridAnalyticalPlacer:
         print(f"SA done: {total} attempts, {accepts} accepts, best proxy={best_proxy:.4f}")
         return best_placement
 
-    def _build_incremental_wl(self, net_indices, net_mask, net_weights, placement, num_all, canvas_norm):
+    def _build_incremental_wl(
+        self, net_indices, net_mask, net_weights, placement, num_all, canvas_norm
+    ):
         """
         Build all data structures needed for incremental WL evaluation.
         Returns (sa_pos, macro_to_nets, net_hpwl, nw_np, eval_fn).
@@ -629,16 +1285,16 @@ class HybridAnalyticalPlacer:
                     seen.add(key)
                     nets.append(list(members))
         return nets
-    
+
     def _compute_congestion_force(self, cong_map, placement, benchmark, num_hard):
         # bin indices for all macros at once
         bin_x = (placement[:num_hard, 0] / self._bin_w).long().clamp(1, benchmark.grid_cols - 2)
         bin_y = (placement[:num_hard, 1] / self._bin_h).long().clamp(1, benchmark.grid_rows - 2)
-        
+
         # finite difference gradient for all macros simultaneously
         dx = cong_map[bin_y, bin_x + 1] - cong_map[bin_y, bin_x - 1]
         dy = cong_map[bin_y + 1, bin_x] - cong_map[bin_y - 1, bin_x]
-        
+
         forces = torch.stack([dx, dy], dim=1)
         return forces
 
@@ -682,8 +1338,8 @@ class HybridAnalyticalPlacer:
                 col = count % grid_cols
                 target_x = spacing_x * (col + 1)
                 target_y = spacing_y * (row + 1)
-                placement[idx, 0] = 0.7 * placement[idx, 0] + 0.3 * target_x
-                placement[idx, 1] = 0.7 * placement[idx, 1] + 0.3 * target_y
+                placement[idx, 0] = 0.99 * placement[idx, 0] + 0.01 * target_x
+                placement[idx, 1] = 0.99 * placement[idx, 1] + 0.01 * target_y
 
         placement = self._settle_soft_macros(
             placement, net_indices, net_mask, nets, benchmark, num_hard, steps=80, lr=0.1
@@ -748,7 +1404,9 @@ class HybridAnalyticalPlacer:
         for _ in range(steps):
             placement.requires_grad_(True)
             alpha = 5.0 + 8.0 * (_ / steps)  # gradually increase alpha for sharper gradients
-            loss, _ = self._compute_wl_loss(placement, net_indices, net_mask, nets, canvas_norm, net_weights=None, alpha=alpha)
+            loss, _ = self._compute_wl_loss(
+                placement, net_indices, net_mask, nets, canvas_norm, net_weights=None, alpha=alpha
+            )
             loss.backward()
             soft_grad = placement.grad.detach()[num_hard:num_all]
             placement.requires_grad_(False)
@@ -763,15 +1421,14 @@ class HybridAnalyticalPlacer:
         return placement
 
     def _compute_density_grid_fast(
-        self, placement: torch.Tensor, benchmark: Benchmark,
-        inflation: float = 1.0
+        self, placement: torch.Tensor, benchmark: Benchmark, inflation: float = 1.0
     ) -> torch.Tensor:
         num_macros = benchmark.num_macros
         sizes = benchmark.macro_sizes[:num_macros]
 
         if inflation != 1.0:
             inflated = sizes.clone()
-            inflated[:benchmark.num_hard_macros] *= inflation
+            inflated[: benchmark.num_hard_macros] *= inflation
             sizes = inflated
 
         cx = placement[:num_macros, 0]
