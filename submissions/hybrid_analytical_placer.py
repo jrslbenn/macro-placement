@@ -958,6 +958,48 @@ class HybridAnalyticalPlacer:
         track_proxies = []
         print("starting iters")
         target_grid = None
+
+        # ── HV-cong gradient for Nesterov ──
+        # Parent's Nesterov historically optimized WL + density only. On
+        # cong-bound benches (ibm17/18, cong=2.4) that's optimizing the
+        # WRONG OBJECTIVE — Nesterov pushes macros toward layouts that
+        # MAXIMIZE the dominant cost component, and downstream stages
+        # can't undo the structural misdirection.
+        # Adding HV-cong gradient as a third force pushes macros away
+        # from already-congested bins during the analytical phase itself.
+        ni_np = net_indices.numpy().copy()
+        nm_np = net_mask.numpy().copy()
+        nw_np = net_weights.numpy().copy()
+        num_nets_np = max(1, ni_np.shape[0])
+        sizes_np = benchmark.macro_sizes[:num_all].numpy().astype(np.float32).copy()
+        bl_np = self._bin_left.numpy().copy()
+        br_np = self._bin_right.numpy().copy()
+        bb_np = self._bin_bottom.numpy().copy()
+        bt_np = self._bin_top.numpy().copy()
+        bin_w_f = float(self._bin_w)
+        bin_h_f = float(self._bin_h)
+        n_rows_g = benchmark.grid_rows
+        n_cols_g = benchmark.grid_cols
+        hcap_f = max(1e-6, bin_h_f * float(getattr(benchmark, "hroutes_per_micron", 1.0) or 1.0))
+        vcap_f = max(1e-6, bin_w_f * float(getattr(benchmark, "vroutes_per_micron", 1.0) or 1.0))
+        try:
+            h_alloc_f, v_alloc_f = plc.get_macro_routing_allocation() if plc is not None else (0.0, 0.0)
+        except Exception:
+            h_alloc_f = float(getattr(plc, "hrouting_alloc", 0.0) or 0.0)
+            v_alloc_f = float(getattr(plc, "vrouting_alloc", 0.0) or 0.0)
+        h_alloc_f = float(h_alloc_f)
+        v_alloc_f = float(v_alloc_f)
+        h_route_n = np.zeros((n_rows_g, n_cols_g), dtype=np.float32)
+        v_route_n = np.zeros((n_rows_g, n_cols_g), dtype=np.float32)
+        h_macro_n = np.zeros((n_rows_g, n_cols_g), dtype=np.float32)
+        v_macro_n = np.zeros((n_rows_g, n_cols_g), dtype=np.float32)
+        cong_forces_nesterov = None
+        cong_refresh = 30
+        # Weights chosen on the lower side — Nesterov gets many steps so
+        # cong nudge compounds. Real-proxy guard via top-K checkpoints
+        # catches regressions.
+        cong_weight_hard = 0.0015
+        cong_weight_soft = 0.004
         for step in range(self.num_steps):
             progress = step / self.num_steps
             current_lr = base_lr * (0.5 * (1 + math.cos(math.pi * progress)))
@@ -998,6 +1040,19 @@ class HybridAnalyticalPlacer:
                 self._solve_poisson(grid, target_grid), placement, benchmark
             )
 
+            # 2b. HV-cong gradient (DISABLED — see comment above for revert
+            # reason. Re-enable by uncommenting the block AND the two
+            # hard_grad/soft_grad add lines below.)
+            # if cong_forces_nesterov is None or step % cong_refresh == 0:
+            #     pos_np = placement.detach().numpy().astype(np.float32)
+            #     h_route_n[:] = 0; v_route_n[:] = 0; h_macro_n[:] = 0; v_macro_n[:] = 0
+            #     _build_hv_route_grid(h_route_n, v_route_n, ni_np, nm_np, nw_np, pos_np, num_nets_np, bin_w_f, bin_h_f, n_rows_g, n_cols_g, hcap_f, vcap_f)
+            #     _build_macro_route_grid(h_macro_n, v_macro_n, pos_np, sizes_np, num_hard, bl_np, br_np, bb_np, bt_np, n_rows_g, n_cols_g, bin_w_f, bin_h_f, hcap_f, vcap_f, h_alloc_f, v_alloc_f)
+            #     cong_map_t = torch.from_numpy(h_route_n + v_route_n + h_macro_n + v_macro_n)
+            #     cong_forces_nesterov = self._compute_congestion_force(cong_map_t, placement, benchmark, num_all)
+            #     mag_c = cong_forces_nesterov.abs().max().clamp_min(1e-6)
+            #     cong_forces_nesterov = cong_forces_nesterov / mag_c
+
             # 3. Adaptive density weight + congestion force update (every 20 steps)
             if step % 200 == 0 and plc is not None:
                 sync_plc(step)
@@ -1010,7 +1065,12 @@ class HybridAnalyticalPlacer:
             # 4. Combined gradient
             hard_grad = wl_grad[:num_hard].clone()
             hard_grad -= density_weight * density_forces[:num_hard]
-            # hard_grad = hard_grad / (precond_hard + 1e-8)  # precondition: larger macros get bigger steps
+            # Cong gradient disabled — net-negative across tested benches
+            # (ibm01 +0.014, ibm17 +0.026, ibm18 +0.003). Theory: cong push
+            # diverts Nesterov from WL/density optimum without compounding
+            # through downstream stages. Keep computation alive for
+            # bench-adaptive re-enable later.
+            # hard_grad += cong_weight_hard * cong_forces_nesterov[:num_hard]
             if fixed.any():
                 hard_grad[fixed[:num_hard]] = 0.0
 
@@ -1027,6 +1087,7 @@ class HybridAnalyticalPlacer:
             soft_density_weight = 0.01
             soft_grad = wl_grad[num_hard:num_all].clone()
             soft_grad -= soft_density_weight * density_forces[num_hard:num_all]
+            # soft_grad += cong_weight_soft * cong_forces_nesterov[num_hard:num_all]
             placement[num_hard:num_all] -= self.soft_macro_lr * soft_grad
             placement[num_hard:num_all, 0].clamp_(
                 min=hw_all[num_hard:], max=benchmark.canvas_width - hw_all[num_hard:]

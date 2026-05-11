@@ -452,6 +452,13 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
         soft_macro_lr: float = 0.15,
         verbose: bool = True,
         enable_plots: bool = True,
+        # Initial placement strategy — for multi-init parallel runs.
+        # 'ibm':      use benchmark's IBM 2004 floorplan (default)
+        # 'spectral': Fiedler-vector spectral layout (parent's helper)
+        # 'perturbed': IBM + Gaussian noise (seed-controlled), then legalize
+        # 'random':   uniform random, then legalize
+        init_strategy: str = "ibm",
+        init_perturb_sigma: float = 0.05,  # used when init_strategy='perturbed'
         # ── DAS-MP dataflow weighting ──
         das_enable: bool = True,
         das_indirect_alpha: float = 0.5,
@@ -550,6 +557,8 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
         self.polish_hard_cong_weight = polish_hard_cong_weight
         self.polish_cong_refresh = polish_cong_refresh
         self.polish_checkpoint_every = polish_checkpoint_every
+        self.init_strategy = init_strategy
+        self.init_perturb_sigma = init_perturb_sigma
         self._das_benchmark_ref: Benchmark | None = None
         self._cached_nets: List[List[int]] | None = None
         self._cached_net_indices: torch.Tensor | None = None
@@ -1794,6 +1803,11 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
         v_macro_grid = np.zeros((n_rows, n_cols), dtype=np.float32)
 
         cong_forces = None  # refreshed periodically
+        # Early-stop: bail after N consecutive checkpoints without improvement.
+        # Polish has a tendency to drift away after the easy gains, burning
+        # budget. Real-proxy guard reverts the final, but the loop still runs.
+        stale_checkpoints = 0
+        max_stale_checkpoints = 5
         for step in range(self.polish_steps):
             placement = placement.detach()
             placement.requires_grad_(True)
@@ -1904,6 +1918,16 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
                 if proxy < best_proxy - 1e-4:
                     best_proxy = proxy
                     best_placement = placement.clone()
+                    stale_checkpoints = 0
+                else:
+                    stale_checkpoints += 1
+                    if stale_checkpoints >= max_stale_checkpoints:
+                        if self.verbose:
+                            print(
+                                f"[polish] early-stop at step {step+1}: "
+                                f"{max_stale_checkpoints} stale checkpoints"
+                            )
+                        break
 
         if self.verbose:
             print(
@@ -1916,7 +1940,60 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
     # Entry points
     # ────────────────────────────────────────────────────────────────
 
+    def _apply_init_strategy(self, benchmark: Benchmark) -> Benchmark:
+        """Replace benchmark.macro_positions per init_strategy. Returns the
+        (possibly modified) benchmark. Does NOT mutate the original."""
+        if self.init_strategy == "ibm":
+            return benchmark  # use the default IBM 2004 floorplan as-is
+
+        import copy
+        bench = copy.copy(benchmark)
+        bench.macro_positions = benchmark.macro_positions.clone()
+        num_hard = benchmark.num_hard_macros
+        num_all = benchmark.num_macros
+        sizes = benchmark.macro_sizes
+        hw = sizes[:, 0] / 2
+        hh = sizes[:, 1] / 2
+        canvas_w = benchmark.canvas_width
+        canvas_h = benchmark.canvas_height
+        gen = torch.Generator().manual_seed(self.seed)
+
+        if self.init_strategy == "spectral":
+            from submissions.hybrid_analytical_placer import spectral_init_placement
+            nets_list = [net.tolist() for net in benchmark.net_nodes if len(net) >= 2]
+            bench.macro_positions = spectral_init_placement(
+                bench.macro_positions, benchmark, nets_list, blend=0.7,
+            )
+        elif self.init_strategy == "perturbed":
+            sigma_x = self.init_perturb_sigma * canvas_w
+            sigma_y = self.init_perturb_sigma * canvas_h
+            noise = torch.empty_like(bench.macro_positions)
+            noise[:, 0].normal_(0.0, sigma_x, generator=gen)
+            noise[:, 1].normal_(0.0, sigma_y, generator=gen)
+            bench.macro_positions = bench.macro_positions + noise
+        elif self.init_strategy == "random":
+            n = num_all
+            bench.macro_positions = torch.empty_like(bench.macro_positions)
+            bench.macro_positions[:, 0].uniform_(0.0, canvas_w, generator=gen)
+            bench.macro_positions[:, 1].uniform_(0.0, canvas_h, generator=gen)
+        else:
+            raise ValueError(f"unknown init_strategy: {self.init_strategy}")
+
+        # Clamp to canvas bounds (per-macro size). Fixed macros stay put.
+        bench.macro_positions[:, 0] = torch.clamp(
+            bench.macro_positions[:, 0], min=hw, max=canvas_w - hw
+        )
+        bench.macro_positions[:, 1] = torch.clamp(
+            bench.macro_positions[:, 1], min=hh, max=canvas_h - hh
+        )
+        if benchmark.macro_fixed.any():
+            bench.macro_positions[benchmark.macro_fixed] = benchmark.macro_positions[benchmark.macro_fixed]
+        if self.verbose:
+            print(f"[init] applied strategy '{self.init_strategy}' (seed={self.seed})")
+        return bench
+
     def place(self, benchmark: Benchmark) -> torch.Tensor:
+        benchmark = self._apply_init_strategy(benchmark)
         self._das_benchmark_ref = benchmark
         self._cached_nets = None
         self._cached_net_indices = None
