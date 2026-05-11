@@ -333,6 +333,388 @@ def _hpwl_batch(net_idxs, ni_np, nm_np, pos):
     return result
 
 
+# ──────────────────────────────────────────────────────────────────
+# HV-separated routing congestion + macro routing blockage.
+# Matches TILOS's congestion model far more accurately than isotropic
+# RUDY: H/V tracked separately, smoothed across cols/rows, with hard
+# macro blockage allocated by overlap area. Originally ported from hap2.
+# ──────────────────────────────────────────────────────────────────
+
+
+@njit
+def _grid_cell_from_xy(x, y, bin_w, bin_h, n_rows, n_cols):
+    r = int(y / bin_h)
+    c = int(x / bin_w)
+    if r < 0:
+        r = 0
+    elif r >= n_rows:
+        r = n_rows - 1
+    if c < 0:
+        c = 0
+    elif c >= n_cols:
+        c = n_cols - 1
+    return r, c
+
+
+@njit
+def _add_h_segment(h_grid, row, c0, c1, weight, hcap, sign, n_rows, n_cols):
+    if row < 0:
+        row = 0
+    elif row >= n_rows:
+        row = n_rows - 1
+    lo = c0
+    hi = c1
+    if lo > hi:
+        tmp = lo
+        lo = hi
+        hi = tmp
+    if lo < 0:
+        lo = 0
+    if hi > n_cols:
+        hi = n_cols
+    delta = sign * weight / hcap
+    for c in range(lo, hi):
+        h_grid[row, c] += delta
+
+
+@njit
+def _add_v_segment(v_grid, col, r0, r1, weight, vcap, sign, n_rows, n_cols):
+    if col < 0:
+        col = 0
+    elif col >= n_cols:
+        col = n_cols - 1
+    lo = r0
+    hi = r1
+    if lo > hi:
+        tmp = lo
+        lo = hi
+        hi = tmp
+    if lo < 0:
+        lo = 0
+    if hi > n_rows:
+        hi = n_rows
+    delta = sign * weight / vcap
+    for r in range(lo, hi):
+        v_grid[r, col] += delta
+
+
+@njit
+def _add_two_pin_route_hv(h_grid, v_grid, sr, sc, tr, tc, weight, hcap, vcap, sign, n_rows, n_cols):
+    _add_h_segment(h_grid, sr, min(sc, tc), max(sc, tc), weight, hcap, sign, n_rows, n_cols)
+    _add_v_segment(v_grid, tc, min(sr, tr), max(sr, tr), weight, vcap, sign, n_rows, n_cols)
+
+
+@njit
+def _sort3_by_col_row(r0, c0, r1, c1, r2, c2):
+    if c0 > c1 or (c0 == c1 and r0 > r1):
+        tr, tc = r0, c0
+        r0, c0 = r1, c1
+        r1, c1 = tr, tc
+    if c1 > c2 or (c1 == c2 and r1 > r2):
+        tr, tc = r1, c1
+        r1, c1 = r2, c2
+        r2, c2 = tr, tc
+    if c0 > c1 or (c0 == c1 and r0 > r1):
+        tr, tc = r0, c0
+        r0, c0 = r1, c1
+        r1, c1 = tr, tc
+    return r0, c0, r1, c1, r2, c2
+
+
+@njit
+def _sort3_by_row_col(r0, c0, r1, c1, r2, c2):
+    if r0 > r1 or (r0 == r1 and c0 > c1):
+        tr, tc = r0, c0
+        r0, c0 = r1, c1
+        r1, c1 = tr, tc
+    if r1 > r2 or (r1 == r2 and c1 > c2):
+        tr, tc = r1, c1
+        r1, c1 = r2, c2
+        r2, c2 = tr, tc
+    if r0 > r1 or (r0 == r1 and c0 > c1):
+        tr, tc = r0, c0
+        r0, c0 = r1, c1
+        r1, c1 = tr, tc
+    return r0, c0, r1, c1, r2, c2
+
+
+@njit
+def _add_three_pin_route_hv(h_grid, v_grid, rows, cols, weight, hcap, vcap, sign, n_rows, n_cols):
+    r1, c1, r2, c2, r3, c3 = _sort3_by_col_row(
+        rows[0], cols[0], rows[1], cols[1], rows[2], cols[2]
+    )
+    if c1 < c2 and c2 < c3 and min(r1, r3) < r2 and max(r1, r3) > r2:
+        _add_h_segment(h_grid, r1, c1, c2, weight, hcap, sign, n_rows, n_cols)
+        _add_h_segment(h_grid, r2, c2, c3, weight, hcap, sign, n_rows, n_cols)
+        _add_v_segment(v_grid, c2, min(r1, r2), max(r1, r2), weight, vcap, sign, n_rows, n_cols)
+        _add_v_segment(v_grid, c3, min(r2, r3), max(r2, r3), weight, vcap, sign, n_rows, n_cols)
+    elif c2 == c3 and c1 < c2 and r1 < min(r2, r3):
+        _add_h_segment(h_grid, r1, c1, c2, weight, hcap, sign, n_rows, n_cols)
+        _add_v_segment(v_grid, c2, r1, max(r2, r3), weight, vcap, sign, n_rows, n_cols)
+    elif r2 == r3:
+        _add_h_segment(h_grid, r1, c1, c2, weight, hcap, sign, n_rows, n_cols)
+        _add_h_segment(h_grid, r2, c2, c3, weight, hcap, sign, n_rows, n_cols)
+        _add_v_segment(v_grid, c2, min(r2, r1), max(r2, r1), weight, vcap, sign, n_rows, n_cols)
+    else:
+        r1, c1, r2, c2, r3, c3 = _sort3_by_row_col(
+            rows[0], cols[0], rows[1], cols[1], rows[2], cols[2]
+        )
+        xmin = min(c1, min(c2, c3))
+        xmax = max(c1, max(c2, c3))
+        _add_h_segment(h_grid, r2, xmin, xmax, weight, hcap, sign, n_rows, n_cols)
+        _add_v_segment(v_grid, c1, min(r1, r2), max(r1, r2), weight, vcap, sign, n_rows, n_cols)
+        _add_v_segment(v_grid, c3, min(r2, r3), max(r2, r3), weight, vcap, sign, n_rows, n_cols)
+
+
+@njit
+def _add_net_route_hv(
+    h_grid, v_grid, net_idx, ni_np, nm_np, nw_np, pos,
+    macro_i, override_x, override_y,
+    bin_w, bin_h, n_rows, n_cols, hcap, vcap, sign,
+):
+    """Star+L pattern routing model. macro_i / override_xy temporarily
+    relocate one endpoint of the net for incremental updates."""
+    max_degree = ni_np.shape[1]
+    rows = np.empty(max_degree, dtype=np.int32)
+    cols = np.empty(max_degree, dtype=np.int32)
+    count = 0
+    src_r = 0
+    src_c = 0
+    source_seen = False
+    weight = nw_np[net_idx]
+
+    for d in range(max_degree):
+        if not nm_np[net_idx, d]:
+            break
+        idx = ni_np[net_idx, d]
+        if idx == macro_i and override_x >= 0.0:
+            x = override_x
+            y = override_y
+        else:
+            x = pos[idx, 0]
+            y = pos[idx, 1]
+        r, c = _grid_cell_from_xy(x, y, bin_w, bin_h, n_rows, n_cols)
+        if not source_seen:
+            src_r = r
+            src_c = c
+            source_seen = True
+        duplicate = False
+        for k in range(count):
+            if rows[k] == r and cols[k] == c:
+                duplicate = True
+                break
+        if not duplicate:
+            rows[count] = r
+            cols[count] = c
+            count += 1
+
+    if count == 2:
+        if rows[0] == src_r and cols[0] == src_c:
+            tr = rows[1]
+            tc = cols[1]
+        else:
+            tr = rows[0]
+            tc = cols[0]
+        _add_two_pin_route_hv(h_grid, v_grid, src_r, src_c, tr, tc, weight, hcap, vcap, sign, n_rows, n_cols)
+    elif count == 3:
+        _add_three_pin_route_hv(h_grid, v_grid, rows, cols, weight, hcap, vcap, sign, n_rows, n_cols)
+    elif count > 3:
+        for k in range(count):
+            if rows[k] == src_r and cols[k] == src_c:
+                continue
+            _add_two_pin_route_hv(
+                h_grid, v_grid, src_r, src_c, rows[k], cols[k],
+                weight, hcap, vcap, sign, n_rows, n_cols,
+            )
+
+
+@njit
+def _build_hv_route_grid(
+    h_grid, v_grid, ni_np, nm_np, nw_np, pos, num_nets,
+    bin_w, bin_h, n_rows, n_cols, hcap, vcap,
+):
+    for n in range(num_nets):
+        _add_net_route_hv(
+            h_grid, v_grid, n, ni_np, nm_np, nw_np, pos, -1, -1.0, -1.0,
+            bin_w, bin_h, n_rows, n_cols, hcap, vcap, 1.0,
+        )
+
+
+@njit
+def _update_hv_route_incr_single(
+    h_grid, v_grid, ni_np, nm_np, nw_np, pos, affected_nets,
+    macro_i, old_x, old_y,
+    bin_w, bin_h, n_rows, n_cols, hcap, vcap,
+):
+    """Subtract net's contribution using old position, re-add with new."""
+    for k in range(len(affected_nets)):
+        n = affected_nets[k]
+        _add_net_route_hv(
+            h_grid, v_grid, n, ni_np, nm_np, nw_np, pos, macro_i, old_x, old_y,
+            bin_w, bin_h, n_rows, n_cols, hcap, vcap, -1.0,
+        )
+        _add_net_route_hv(
+            h_grid, v_grid, n, ni_np, nm_np, nw_np, pos, -1, -1.0, -1.0,
+            bin_w, bin_h, n_rows, n_cols, hcap, vcap, 1.0,
+        )
+
+
+@njit
+def _add_macro_route_blockage(
+    h_macro, v_macro, cx, cy, hw, hh, bl, br, bb, bt,
+    n_rows, n_cols, bin_w, bin_h, hcap, vcap, h_alloc, v_alloc, sign,
+):
+    """Macros block routing tracks in proportion to their overlap with bins."""
+    left = cx - hw
+    right = cx + hw
+    bottom = cy - hh
+    top = cy + hh
+    c0 = max(0, int(left / bin_w))
+    c1 = min(n_cols - 1, int(right / bin_w))
+    r0 = max(0, int(bottom / bin_h))
+    r1 = min(n_rows - 1, int(top / bin_h))
+    partial_vertical = False
+    partial_horizontal = False
+    for r in range(r0, r1 + 1):
+        for c in range(c0, c1 + 1):
+            ox = min(right, br[c]) - max(left, bl[c])
+            oy = min(top, bt[r]) - max(bottom, bb[r])
+            if ox > 0.0 and oy > 0.0:
+                if r0 != r1 and (r == r0 or r == r1) and abs(oy - bin_h) > 1e-5:
+                    partial_vertical = True
+                if c0 != c1 and (c == c0 or c == c1) and abs(ox - bin_w) > 1e-5:
+                    partial_horizontal = True
+                v_macro[r, c] += sign * ox * v_alloc / vcap
+                h_macro[r, c] += sign * oy * h_alloc / hcap
+    if partial_vertical:
+        r = r1
+        for c in range(c0, c1 + 1):
+            ox = min(right, br[c]) - max(left, bl[c])
+            oy = min(top, bt[r]) - max(bottom, bb[r])
+            if ox > 0.0 and oy > 0.0:
+                v_macro[r, c] -= sign * ox * v_alloc / vcap
+    if partial_horizontal:
+        c = c1
+        for r in range(r0, r1 + 1):
+            ox = min(right, br[c]) - max(left, bl[c])
+            oy = min(top, bt[r]) - max(bottom, bb[r])
+            if ox > 0.0 and oy > 0.0:
+                h_macro[r, c] -= sign * oy * h_alloc / hcap
+
+
+@njit
+def _build_macro_route_grid(
+    h_macro, v_macro, pos, sizes, num_hard, bl, br, bb, bt,
+    n_rows, n_cols, bin_w, bin_h, hcap, vcap, h_alloc, v_alloc,
+):
+    for m in range(num_hard):
+        _add_macro_route_blockage(
+            h_macro, v_macro, pos[m, 0], pos[m, 1],
+            sizes[m, 0] / 2.0, sizes[m, 1] / 2.0,
+            bl, br, bb, bt, n_rows, n_cols, bin_w, bin_h,
+            hcap, vcap, h_alloc, v_alloc, 1.0,
+        )
+
+
+@njit
+def _update_macro_route_incr_single(
+    h_macro, v_macro, old_x, old_y, new_x, new_y, hw, hh,
+    bl, br, bb, bt, n_rows, n_cols, bin_w, bin_h,
+    hcap, vcap, h_alloc, v_alloc,
+):
+    _add_macro_route_blockage(
+        h_macro, v_macro, old_x, old_y, hw, hh, bl, br, bb, bt,
+        n_rows, n_cols, bin_w, bin_h, hcap, vcap, h_alloc, v_alloc, -1.0,
+    )
+    _add_macro_route_blockage(
+        h_macro, v_macro, new_x, new_y, hw, hh, bl, br, bb, bt,
+        n_rows, n_cols, bin_w, bin_h, hcap, vcap, h_alloc, v_alloc, 1.0,
+    )
+
+
+@njit
+def _hv_congestion_cost_top5(h_grid, v_grid, h_macro, v_macro, smooth_range):
+    """Mean of top 5% across the smoothed H+macro / V+macro distributions
+    (matches TILOS get_congestion_cost = abu(V+H, 0.05) shape)."""
+    n_rows = h_grid.shape[0]
+    n_cols = h_grid.shape[1]
+    v_smooth = np.zeros((n_rows, n_cols), dtype=np.float32)
+    h_smooth = np.zeros((n_rows, n_cols), dtype=np.float32)
+    for r in range(n_rows):
+        for c in range(n_cols):
+            lp = c - smooth_range
+            if lp < 0:
+                lp = 0
+            rp = c + smooth_range
+            if rp >= n_cols:
+                rp = n_cols - 1
+            count = rp - lp + 1
+            val = v_grid[r, c] / count
+            for cc in range(lp, rp + 1):
+                v_smooth[r, cc] += val
+    for r in range(n_rows):
+        for c in range(n_cols):
+            lp = r - smooth_range
+            if lp < 0:
+                lp = 0
+            up = r + smooth_range
+            if up >= n_rows:
+                up = n_rows - 1
+            count = up - lp + 1
+            val = h_grid[r, c] / count
+            for rr in range(lp, up + 1):
+                h_smooth[rr, c] += val
+    n = n_rows * n_cols
+    flat = np.empty(n * 2, dtype=np.float32)
+    idx = 0
+    for r in range(n_rows):
+        for c in range(n_cols):
+            flat[idx] = v_smooth[r, c] + v_macro[r, c]
+            flat[n + idx] = h_smooth[r, c] + h_macro[r, c]
+            idx += 1
+    k = max(1, int(flat.shape[0] * 0.05))
+    top_idx = np.argpartition(flat, -k)[-k:]
+    return flat[top_idx].mean()
+
+
+@njit
+def _hv_pressure_grid(h_grid, v_grid, h_macro, v_macro, smooth_range, out):
+    """Per-bin pressure value = max(H_total, V_total) after smoothing."""
+    n_rows = h_grid.shape[0]
+    n_cols = h_grid.shape[1]
+    v_smooth = np.zeros((n_rows, n_cols), dtype=np.float32)
+    h_smooth = np.zeros((n_rows, n_cols), dtype=np.float32)
+    for r in range(n_rows):
+        for c in range(n_cols):
+            lp = c - smooth_range
+            if lp < 0:
+                lp = 0
+            rp = c + smooth_range
+            if rp >= n_cols:
+                rp = n_cols - 1
+            count = rp - lp + 1
+            val = v_grid[r, c] / count
+            for cc in range(lp, rp + 1):
+                v_smooth[r, cc] += val
+    for r in range(n_rows):
+        for c in range(n_cols):
+            lp = r - smooth_range
+            if lp < 0:
+                lp = 0
+            up = r + smooth_range
+            if up >= n_rows:
+                up = n_rows - 1
+            count = up - lp + 1
+            val = h_grid[r, c] / count
+            for rr in range(lp, up + 1):
+                h_smooth[rr, c] += val
+    for r in range(n_rows):
+        for c in range(n_cols):
+            v_val = v_smooth[r, c] + v_macro[r, c]
+            h_val = h_smooth[r, c] + h_macro[r, c]
+            out[r, c] = max(v_val, h_val)
+
+
 def spectral_init_placement(
     placement: torch.Tensor,
     benchmark,
@@ -980,11 +1362,41 @@ class HybridAnalyticalPlacer:
             density_grid = np.zeros((n_rows, n_cols), dtype=np.float32)
             _build_density_grid(density_grid, sa_pos, sizes_np, num_all, bl, br, bb, bt, bin_area, n_rows, n_cols, bin_w, bin_h)
 
-            rudy_grid = np.zeros((n_rows, n_cols), dtype=np.float32)
-            _build_rudy_grid(rudy_grid, ni_np, nm_np, sa_pos, num_nets, bin_w, bin_h, n_rows, n_cols)
+            # HV-separated routing congestion + macro blockage — matches TILOS
+            # structurally (was RUDY before; calibration drifted because RUDY
+            # is a fundamentally different metric than the real cong cost).
+            nw_np = net_weights.numpy().copy()
+            hcap = max(1e-6, bin_h * float(getattr(benchmark, "hroutes_per_micron", 1.0) or 1.0))
+            vcap = max(1e-6, bin_w * float(getattr(benchmark, "vroutes_per_micron", 1.0) or 1.0))
+            try:
+                smooth_range = int(plc.get_congestion_smooth_range())
+            except Exception:
+                smooth_range = int(getattr(plc, "smooth_range", 2) or 2)
+            smooth_range = max(0, smooth_range)
+            try:
+                h_alloc, v_alloc = plc.get_macro_routing_allocation()
+            except Exception:
+                h_alloc = float(getattr(plc, "hrouting_alloc", 0.0) or 0.0)
+                v_alloc = float(getattr(plc, "vrouting_alloc", 0.0) or 0.0)
+            h_alloc = float(h_alloc)
+            v_alloc = float(v_alloc)
+            h_route_grid = np.zeros((n_rows, n_cols), dtype=np.float32)
+            v_route_grid = np.zeros((n_rows, n_cols), dtype=np.float32)
+            h_macro_grid = np.zeros((n_rows, n_cols), dtype=np.float32)
+            v_macro_grid = np.zeros((n_rows, n_cols), dtype=np.float32)
+            _build_hv_route_grid(
+                h_route_grid, v_route_grid, ni_np, nm_np, nw_np, sa_pos, num_nets,
+                bin_w, bin_h, n_rows, n_cols, hcap, vcap,
+            )
+            _build_macro_route_grid(
+                h_macro_grid, v_macro_grid, sa_pos, sizes_np, num_hard, bl, br, bb, bt,
+                n_rows, n_cols, bin_w, bin_h, hcap, vcap, h_alloc, v_alloc,
+            )
 
             current_den = _density_cost_top5(density_grid)
-            current_cong = _congestion_cost_top5(rudy_grid)
+            current_cong = _hv_congestion_cost_top5(
+                h_route_grid, v_route_grid, h_macro_grid, v_macro_grid, smooth_range
+            )
 
             # Calibrate fast proxy to match real proxy scale
             _set_placement(plc, sa_placement.detach(), benchmark)
@@ -997,7 +1409,7 @@ class HybridAnalyticalPlacer:
             current_proxy = total_wl + 0.5 * (current_den * den_scale) + .5 * (current_cong * cong_scale)
 
             best_placement = sa_placement.clone()
-            print(f"SA displace start: real={best_proxy:.4f} fast={current_proxy:.4f} wl={total_wl:.4f} den_scale={den_scale:.4f} cong_scale={cong_scale:.4f}")
+            print(f"SA displace start: real={best_proxy:.4f} fast={current_proxy:.4f} wl={total_wl:.4f} den_scale={den_scale:.4f} cong_scale={cong_scale:.4f} (HV cong, smooth={smooth_range})")
 
             accepts = total = stalls = 0
             last_accept_step = 0
@@ -1011,10 +1423,14 @@ class HybridAnalyticalPlacer:
                 if accepts > 0 and accepts % 500 == 0 and accepts % checkpoint_every != 0:
                     density_grid[:] = 0
                     _build_density_grid(density_grid, sa_pos, sizes_np, num_all, bl, br, bb, bt, bin_area, n_rows, n_cols, bin_w, bin_h)
-                    rudy_grid[:] = 0
-                    _build_rudy_grid(rudy_grid, ni_np, nm_np, sa_pos, num_nets, bin_w, bin_h, n_rows, n_cols)
+                    h_route_grid[:] = 0
+                    v_route_grid[:] = 0
+                    h_macro_grid[:] = 0
+                    v_macro_grid[:] = 0
+                    _build_hv_route_grid(h_route_grid, v_route_grid, ni_np, nm_np, nw_np, sa_pos, num_nets, bin_w, bin_h, n_rows, n_cols, hcap, vcap)
+                    _build_macro_route_grid(h_macro_grid, v_macro_grid, sa_pos, sizes_np, num_hard, bl, br, bb, bt, n_rows, n_cols, bin_w, bin_h, hcap, vcap, h_alloc, v_alloc)
                     current_den = _density_cost_top5(density_grid)
-                    current_cong = _congestion_cost_top5(rudy_grid)
+                    current_cong = _hv_congestion_cost_top5(h_route_grid, v_route_grid, h_macro_grid, v_macro_grid, smooth_range)
                     current_proxy = total_wl + 0.5 * (current_den * den_scale) + .5 * (current_cong * cong_scale)
 
                 if total % 100000 == 0 and total > 0:
@@ -1064,8 +1480,11 @@ class HybridAnalyticalPlacer:
                                     hw_np[i], hh_np[i], bl, br, bb, bt, bin_area, n_rows, n_cols, bin_w, bin_h)
                 new_den = _density_cost_top5(density_grid)
 
-                _update_rudy_incr_single(rudy_grid, ni_np, nm_np, sa_pos, aff, i, old_x, old_y, bin_w, bin_h, n_rows, n_cols)
-                new_cong = _congestion_cost_top5(rudy_grid)
+                # Incremental HV routing update (nets touching i) +
+                # macro blockage update (i moved).
+                _update_hv_route_incr_single(h_route_grid, v_route_grid, ni_np, nm_np, nw_np, sa_pos, aff, i, old_x, old_y, bin_w, bin_h, n_rows, n_cols, hcap, vcap)
+                _update_macro_route_incr_single(h_macro_grid, v_macro_grid, old_x, old_y, new_x, new_y, hw_np[i], hh_np[i], bl, br, bb, bt, n_rows, n_cols, bin_w, bin_h, hcap, vcap, h_alloc, v_alloc)
+                new_cong = _hv_congestion_cost_top5(h_route_grid, v_route_grid, h_macro_grid, v_macro_grid, smooth_range)
 
                 new_proxy = (total_wl + wl_delta) + 0.5 * (new_den * den_scale) + .5 * (new_cong * cong_scale)
 
@@ -1082,8 +1501,17 @@ class HybridAnalyticalPlacer:
 
                     if accepts % checkpoint_every == 0:
                         _set_placement(plc, sa_placement.detach(), benchmark)
-                        real_proxy = compute_proxy_cost(sa_placement.detach(), benchmark, plc)["proxy_cost"]
-                        print(f"  step={total} accepts={accepts} wl={total_wl:.4f} fast={current_proxy:.4f} real={real_proxy:.4f} [{time()-t0:.0f}s]")
+                        real_metrics = compute_proxy_cost(sa_placement.detach(), benchmark, plc)
+                        real_proxy = real_metrics["proxy_cost"]
+                        # Recalibrate surrogate at every checkpoint — the
+                        # top-N percentile structure of density/cong means
+                        # initial scales drift as the bin-leaderboard changes.
+                        # Without this, the fast proxy lies more and more
+                        # (saw gap widen from 0.04 → 0.08 on ibm18).
+                        den_scale = real_metrics['density_cost'] / (current_den + 1e-8)
+                        cong_scale = real_metrics['congestion_cost'] / (current_cong + 1e-8)
+                        current_proxy = total_wl + 0.5 * (current_den * den_scale) + .5 * (current_cong * cong_scale)
+                        print(f"  step={total} accepts={accepts} wl={total_wl:.4f} fast={current_proxy:.4f} real={real_proxy:.4f} den_s={den_scale:.4f} cong_s={cong_scale:.4f} [{time()-t0:.0f}s]")
                         if real_proxy < best_proxy:
                             best_proxy = real_proxy
                             best_placement = sa_placement.clone()
@@ -1095,10 +1523,20 @@ class HybridAnalyticalPlacer:
                             total_wl = float(net_hpwl.sum()) / (num_nets * canvas_norm)
                             density_grid[:] = 0
                             _build_density_grid(density_grid, sa_pos, sizes_np, num_all, bl, br, bb, bt, bin_area, n_rows, n_cols, bin_w, bin_h)
-                            rudy_grid[:] = 0
-                            _build_rudy_grid(rudy_grid, ni_np, nm_np, sa_pos, num_nets, bin_w, bin_h, n_rows, n_cols)
+                            h_route_grid[:] = 0
+                            v_route_grid[:] = 0
+                            h_macro_grid[:] = 0
+                            v_macro_grid[:] = 0
+                            _build_hv_route_grid(h_route_grid, v_route_grid, ni_np, nm_np, nw_np, sa_pos, num_nets, bin_w, bin_h, n_rows, n_cols, hcap, vcap)
+                            _build_macro_route_grid(h_macro_grid, v_macro_grid, sa_pos, sizes_np, num_hard, bl, br, bb, bt, n_rows, n_cols, bin_w, bin_h, hcap, vcap, h_alloc, v_alloc)
                             current_den = _density_cost_top5(density_grid)
-                            current_cong = _congestion_cost_top5(rudy_grid)
+                            current_cong = _hv_congestion_cost_top5(h_route_grid, v_route_grid, h_macro_grid, v_macro_grid, smooth_range)
+                            # After revert, components are now for best state.
+                            # Refit scales to best so fast proxy is honest here too.
+                            _set_placement(plc, sa_placement.detach(), benchmark)
+                            best_metrics = compute_proxy_cost(sa_placement.detach(), benchmark, plc)
+                            den_scale = best_metrics['density_cost'] / (current_den + 1e-8)
+                            cong_scale = best_metrics['congestion_cost'] / (current_cong + 1e-8)
                             current_proxy = total_wl + 0.5 * (current_den * den_scale) + .5 * (current_cong * cong_scale)
                             stalls += 1
                             if stalls >= 6:
@@ -1111,7 +1549,10 @@ class HybridAnalyticalPlacer:
                     sa_pos[i, 1] = old_y
                     _update_density_incr(density_grid, new_x, new_y, old_x, old_y,
                                         hw_np[i], hh_np[i], bl, br, bb, bt, bin_area, n_rows, n_cols, bin_w, bin_h)
-                    _update_rudy_incr_single(rudy_grid, ni_np, nm_np, sa_pos, aff, i, new_x, new_y, bin_w, bin_h, n_rows, n_cols)
+                    # Reverse the HV updates: pass new_x/new_y as "old" so
+                    # subtract uses new, add uses old (which is now in sa_pos).
+                    _update_hv_route_incr_single(h_route_grid, v_route_grid, ni_np, nm_np, nw_np, sa_pos, aff, i, new_x, new_y, bin_w, bin_h, n_rows, n_cols, hcap, vcap)
+                    _update_macro_route_incr_single(h_macro_grid, v_macro_grid, new_x, new_y, old_x, old_y, hw_np[i], hh_np[i], bl, br, bb, bt, n_rows, n_cols, bin_w, bin_h, hcap, vcap, h_alloc, v_alloc)
 
                 if total - last_accept_step > 5_000_000:
                     print(f"SA displace: no accepts in 5M attempts, stopping")
@@ -1317,7 +1758,7 @@ class HybridAnalyticalPlacer:
                         )
                         total_wl = float(net_hpwl.sum()) / (num_nets * canvas_norm)
                         stalls += 1
-                        if stalls >= 4:
+                        if stalls >= 6:
                             print("SA stalled")
                             break
 
@@ -1415,7 +1856,7 @@ class HybridAnalyticalPlacer:
                         )
                         total_wl = float(net_hpwl.sum()) / (num_nets * canvas_norm)
                         stalls += 1
-                        if stalls >= 3:
+                        if stalls >= 10:
                             print("SA soft swap stalled")
                             break
             else:
@@ -1521,6 +1962,11 @@ class HybridAnalyticalPlacer:
 
         soft_density, rudy_grid, hot_grid = rebuild_maps()
         accepts = total = stalls = 0
+        # Persists across retries: each revert widens search radius and
+        # raises the uphill tolerance so retry batches generate genuinely
+        # different proposals (without this the 50-tries-then-revert
+        # pattern just re-explores the same neighborhood).
+        stale_level = 0
         t0 = time()
         rebuild_every = 75
         checkpoint_accepts = 0
@@ -1552,6 +1998,9 @@ class HybridAnalyticalPlacer:
                 elapsed_frac = min(1.0, (time() - t0) / max(budget, 1e-6))
                 base_radius = canvas_norm * (0.025 * (1 - elapsed_frac) + 0.008 * elapsed_frac)
                 max_wl_uphill = 0.00015 * (1 - elapsed_frac) + 0.00005 * elapsed_frac
+                # Staleness widens the search and loosens uphill tolerance.
+                base_radius *= 1.0 + 0.6 * stale_level
+                max_wl_uphill *= 1.0 + 0.5 * stale_level
 
                 candidates = []
                 for radius_scale in (0.4, 0.8, 1.2):
@@ -1621,6 +2070,7 @@ class HybridAnalyticalPlacer:
                         best_proxy = proxy
                         best_placement = spread_placement.clone()
                         stalls = 0
+                        stale_level = 0
                     else:
                         spread_placement = best_placement.clone()
                         pos[:] = best_placement.detach().numpy()
@@ -1630,7 +2080,8 @@ class HybridAnalyticalPlacer:
                         total_wl = float(net_hpwl.sum()) / (num_nets * canvas_norm)
                         soft_density, rudy_grid, hot_grid = rebuild_maps()
                         stalls += 1
-                        if stalls >= 1:
+                        stale_level = min(stale_level + 1, 5)
+                        if stalls >= 8:
                             print("Soft spread stalled")
                             print(
                                 f"Soft spread done: {total} tried, {accepts} accepts, "
@@ -1770,7 +2221,7 @@ class HybridAnalyticalPlacer:
                         )
                         total_wl = float(net_hpwl.sum()) / (num_nets * canvas_norm)
                         stalls += 1
-                        if stalls >= 3:
+                        if stalls >= 6:
                             print("SA soft displace stalled")
                             break
             else:
