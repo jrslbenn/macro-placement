@@ -273,11 +273,19 @@ def _update_rudy_incr_single(rudy_grid, ni_np, nm_np, pos, affected_nets,
 
 @njit
 def _density_cost_top5(grid):
+    """
+    TILOS-faithful density cost: 0.5 * mean(top 10% of grid cells).
+
+    Function name is legacy (was buggy: used 5% without 0.5 multiplier).
+    Now structurally matches plc.get_density_cost() exactly — fast surrogate
+    becomes the real cost, eliminating calibration drift.
+    See external/.../plc_client_os.py:1083-1109.
+    """
     flat = grid.flatten()
     n = len(flat)
-    k = max(1, int(n * 0.05))
+    k = max(1, int(n * 0.10))
     idx = np.argpartition(flat, -k)[-k:]
-    return flat[idx].mean()
+    return 0.5 * flat[idx].mean()
 
 
 @njit
