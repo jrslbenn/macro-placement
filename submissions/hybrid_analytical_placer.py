@@ -880,9 +880,12 @@ class HybridAnalyticalPlacer:
         smooth_density_soft_scale: float = 10.0,
         # RePlAce routability inflation: per-macro effective size grows in
         # hot routing bins, biasing Nesterov to push them out → opens
-        # routing channels → cong drops. Ported from hap2; hap2 used this
-        # successfully to reach 1.315 overall.
-        use_routability_inflation: bool = True,
+        # routing channels → cong drops. Ported from hap2.
+        # NOTE: default OFF after A/B showed marginal regression on
+        # ibm14 (+0.003) and ibm18 (+0.004). Theory: doesn't compose well
+        # with other downstream stages we have that didn't exist in hap2.
+        # Keep as opt-in flag.
+        use_routability_inflation: bool = False,
         inflation_update_every: int = 200,
         inflation_growth: float = 0.030,
         inflation_decay: float = 0.040,
