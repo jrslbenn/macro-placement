@@ -49,6 +49,7 @@ _build_density_grid = _parent_mod._build_density_grid
 _update_density_incr = _parent_mod._update_density_incr
 _density_cost_top5 = _parent_mod._density_cost_top5
 _hpwl_batch = _parent_mod._hpwl_batch
+ProgressGate = _parent_mod.ProgressGate
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -923,17 +924,21 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
         fast_evals = 0
         real_evals = 1
         stale_sweeps = 0
-        stale_checkpoints = 0
         checkpoint_accepts = 0
         last_checkpoint_t = t0
         score_grid = make_pressure_score()
         span = benchmark.canvas_width + benchmark.canvas_height
         stop_reason = "budget"
+        # ProgressGate: adaptive momentum-based early stop. Improvements
+        # build patience; non-improvements drain it. Replaces the fixed
+        # stale_checkpoints counter with a self-tuning version.
+        gate = ProgressGate(base_patience=4, bonus_per_gain=2, max_patience=12)
+        gate.best = best_proxy
 
         while (
             time() - t0 < budget
             and stale_sweeps < self.ch_max_stale_sweeps
-            and stale_checkpoints < self.ch_max_stale_checkpoints
+            and gate.patience > 0
         ):
             # Order macros by descending bin-pressure → tackle worst first.
             hard_bins_r = np.clip((pos[:num_hard, 1] / bin_h).astype(np.int32), 0, n_rows - 1)
@@ -1157,7 +1162,8 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
                             )
                         checkpoint_accepts = 0
                         last_checkpoint_t = time()
-                        if real_proxy < best_proxy - 1e-4:
+                        improved, should_stop = gate.update(real_proxy)
+                        if improved:
                             best_proxy = real_proxy
                             best = cur.clone()
                             # Recalibrate surrogate scales to track real proxy.
@@ -1169,16 +1175,18 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
                                 + 0.5 * current_den * den_scale
                                 + 0.5 * current_cong * cong_scale
                             )
-                            stale_checkpoints = 0
+                            if self.verbose:
+                                print(f"    gate: +imp, patience={gate.patience}/{gate.max_patience}")
                         else:
-                            stale_checkpoints += 1
                             cur = best.clone()
                             rebuild_fast_state(cur)
                             score_grid = make_pressure_score()
-                            if stale_checkpoints >= self.ch_max_stale_checkpoints:
-                                stop_reason = f"stale_checkpoints={stale_checkpoints}"
+                            if self.verbose:
+                                print(f"    gate: miss, patience={gate.patience}/{gate.max_patience}")
+                            if should_stop:
+                                stop_reason = f"progress_gate (best={gate.best:.4f})"
                                 if self.verbose:
-                                    print("Channel relocate stalled")
+                                    print("Channel relocate stalled (progress gate)")
                                 break
 
             if moved_this_sweep == 0:
@@ -1193,10 +1201,10 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
 
         if time() - t0 >= budget:
             stop_reason = "budget"
-        elif stale_checkpoints >= self.ch_max_stale_checkpoints:
-            stop_reason = f"stale_checkpoints={stale_checkpoints}"
         elif stale_sweeps >= self.ch_max_stale_sweeps:
             stop_reason = f"stale_sweeps={stale_sweeps}"
+        elif gate.patience <= 0:
+            stop_reason = f"progress_gate(best={gate.best:.4f})"
 
         # Final checkpoint if any uncommitted accepts.
         if checkpoint_accepts > 0:
@@ -1401,12 +1409,13 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
         fast_evals = 0
         real_evals = 1
         stale_sweeps = 0
-        stale_checkpoints = 0
         checkpoint_accepts = 0
         last_checkpoint_t = t0
         score_grid = make_pressure_score()
         span = benchmark.canvas_width + benchmark.canvas_height
         stop_reason = "budget"
+        gate = ProgressGate(base_patience=4, bonus_per_gain=2, max_patience=12)
+        gate.best = best_proxy
 
         # Coarse region grid for soft long-range moves.
         region_rows = min(8, max(3, n_rows // 4))
@@ -1454,7 +1463,7 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
         while (
             time() - t0 < budget
             and stale_sweeps < self.sch_max_stale_sweeps
-            and stale_checkpoints < self.sch_max_stale_checkpoints
+            and gate.patience > 0
         ):
             soft_bins_r = np.clip((pos[num_hard:num_all, 1] / bin_h).astype(np.int32), 0, n_rows - 1)
             soft_bins_c = np.clip((pos[num_hard:num_all, 0] / bin_w).astype(np.int32), 0, n_cols - 1)
@@ -1654,7 +1663,8 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
                             )
                         checkpoint_accepts = 0
                         last_checkpoint_t = time()
-                        if real_proxy < best_proxy - 1e-4:
+                        improved, should_stop = gate.update(real_proxy)
+                        if improved:
                             best_proxy = real_proxy
                             best = cur.clone()
                             wl_scale = metrics["wirelength_cost"] / (total_wl + 1e-8)
@@ -1665,16 +1675,18 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
                                 + 0.5 * current_den * den_scale
                                 + 0.5 * current_cong * cong_scale
                             )
-                            stale_checkpoints = 0
+                            if self.verbose:
+                                print(f"    gate: +imp, patience={gate.patience}/{gate.max_patience}")
                         else:
-                            stale_checkpoints += 1
                             cur = best.clone()
                             rebuild_fast_state(cur)
                             score_grid = make_pressure_score()
-                            if stale_checkpoints >= self.sch_max_stale_checkpoints:
-                                stop_reason = f"stale_checkpoints={stale_checkpoints}"
+                            if self.verbose:
+                                print(f"    gate: miss, patience={gate.patience}/{gate.max_patience}")
+                            if should_stop:
+                                stop_reason = f"progress_gate(best={gate.best:.4f})"
                                 if self.verbose:
-                                    print("Soft channel relocate stalled")
+                                    print("Soft channel relocate stalled (progress gate)")
                                 break
 
             if moved_this_sweep == 0:
@@ -1689,10 +1701,10 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
 
         if time() - t0 >= budget:
             stop_reason = "budget"
-        elif stale_checkpoints >= self.sch_max_stale_checkpoints:
-            stop_reason = f"stale_checkpoints={stale_checkpoints}"
         elif stale_sweeps >= self.sch_max_stale_sweeps:
             stop_reason = f"stale_sweeps={stale_sweeps}"
+        elif gate.patience <= 0:
+            stop_reason = f"progress_gate(best={gate.best:.4f})"
 
         if checkpoint_accepts > 0:
             _set_placement(plc, cur.detach(), benchmark)
@@ -1806,8 +1818,8 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
         # Early-stop: bail after N consecutive checkpoints without improvement.
         # Polish has a tendency to drift away after the easy gains, burning
         # budget. Real-proxy guard reverts the final, but the loop still runs.
-        stale_checkpoints = 0
-        max_stale_checkpoints = 5
+        polish_gate = ProgressGate(base_patience=4, bonus_per_gain=2, max_patience=10)
+        polish_gate.best = best_proxy
         for step in range(self.polish_steps):
             placement = placement.detach()
             placement.requires_grad_(True)
@@ -1915,19 +1927,17 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
                         f"den={metrics['density_cost']:.4f} cong={metrics['congestion_cost']:.4f} "
                         f"best={best_proxy:.4f}"
                     )
-                if proxy < best_proxy - 1e-4:
+                improved, should_stop = polish_gate.update(proxy)
+                if improved:
                     best_proxy = proxy
                     best_placement = placement.clone()
-                    stale_checkpoints = 0
-                else:
-                    stale_checkpoints += 1
-                    if stale_checkpoints >= max_stale_checkpoints:
-                        if self.verbose:
-                            print(
-                                f"[polish] early-stop at step {step+1}: "
-                                f"{max_stale_checkpoints} stale checkpoints"
-                            )
-                        break
+                elif should_stop:
+                    if self.verbose:
+                        print(
+                            f"[polish] early-stop at step {step+1}: "
+                            f"progress gate exhausted (best={polish_gate.best:.4f})"
+                        )
+                    break
 
         if self.verbose:
             print(

@@ -27,6 +27,57 @@ from macro_place.loader import load_benchmark, load_benchmark_from_dir
 from macro_place.objective import _set_placement, compute_proxy_cost
 
 
+class ProgressGate:
+    """
+    Adaptive early-stop with momentum, for SA-style refinement stages.
+
+    Each accepted real-proxy IMPROVEMENT adds `bonus` to a patience
+    budget (capped at `max_patience`). Each non-improvement burns 1
+    patience. Stop when patience hits 0.
+
+    Behavior model:
+      - Stage finds gains → momentum grows → more time granted
+      - Gains dry up → patience drains, stage winds down
+      - If gains return → patience refills automatically
+      - Self-tuning vs fixed stale_checkpoints thresholds
+
+    Usage:
+        gate = ProgressGate(base_patience=4, bonus_per_gain=2, max_patience=12)
+        ...
+        improved, should_stop = gate.update(real_proxy)
+        if improved:
+            commit_new_best()
+        elif should_stop:
+            break
+    """
+    __slots__ = ("base_patience", "bonus", "max_patience", "patience", "best", "history")
+
+    def __init__(self, base_patience: int = 4, bonus_per_gain: int = 2, max_patience: int = 12):
+        self.base_patience = base_patience
+        self.bonus = bonus_per_gain
+        self.max_patience = max_patience
+        self.patience = base_patience
+        self.best = float("inf")
+        self.history: List[Tuple[str, float, int]] = []
+
+    def update(self, proxy: float) -> Tuple[bool, bool]:
+        """Returns (improved, should_stop)."""
+        if proxy < self.best - 1e-4:
+            self.best = proxy
+            self.patience = min(self.max_patience, self.patience + self.bonus)
+            self.history.append(("+", proxy, self.patience))
+            return True, False
+        self.patience -= 1
+        self.history.append((".", proxy, self.patience))
+        return False, self.patience <= 0
+
+    def __repr__(self) -> str:
+        return (
+            f"ProgressGate(patience={self.patience}/{self.max_patience}, "
+            f"best={self.best:.4f}, history={len(self.history)})"
+        )
+
+
 def strong_legalize(placement, benchmark, gap=0.021, max_iters=200):
     """
     Push overlapping hard macros apart with minimum displacement.
@@ -810,6 +861,33 @@ class HybridAnalyticalPlacer:
         soft_macro_lr: float = 0.15,
         verbose: bool = True,
         enable_plots: bool = True,
+        # Differentiable density: smooth top-frac mean of bin densities,
+        # added to WL loss as a single combined objective. Replaces
+        # Poisson-based density forces (which optimized L2-spread, NOT
+        # top-N percentile — causing Nesterov divergence on cong-bound
+        # benches like ibm18 where density goes from 1.04 → 0.74 but
+        # cong + WL both spike). Set use_smooth_density=False to fall
+        # back to the old Poisson approach for A/B.
+        # NOTE: default OFF after A/B showed it's bench-selective:
+        # ibm01 -0.015 (helps), but ibm10 +0.053 / ibm14 +0.084 (hurts).
+        # Smooth-density diverts Nesterov from the WL+density basin on
+        # benches where density isn't the bottleneck. Keep as opt-in
+        # for cong-heavy benches like ibm17/ibm18 if needed.
+        use_smooth_density: bool = False,
+        smooth_density_frac: float = 0.10,
+        smooth_density_tau: float = 0.05,
+        smooth_density_weight: float = 0.05,
+        smooth_density_soft_scale: float = 10.0,
+        # RePlAce routability inflation: per-macro effective size grows in
+        # hot routing bins, biasing Nesterov to push them out → opens
+        # routing channels → cong drops. Ported from hap2; hap2 used this
+        # successfully to reach 1.315 overall.
+        use_routability_inflation: bool = True,
+        inflation_update_every: int = 200,
+        inflation_growth: float = 0.030,
+        inflation_decay: float = 0.040,
+        inflation_hard_cap: float = 1.28,
+        inflation_soft_cap: float = 1.55,
     ):
         self.seed = seed
         self.num_steps = num_steps
@@ -818,6 +896,17 @@ class HybridAnalyticalPlacer:
         self.soft_macro_lr = soft_macro_lr
         self.verbose = verbose
         self.enable_plots = enable_plots
+        self.use_smooth_density = use_smooth_density
+        self.smooth_density_frac = smooth_density_frac
+        self.smooth_density_tau = smooth_density_tau
+        self.smooth_density_weight = smooth_density_weight
+        self.smooth_density_soft_scale = smooth_density_soft_scale
+        self.use_routability_inflation = use_routability_inflation
+        self.inflation_update_every = inflation_update_every
+        self.inflation_growth = inflation_growth
+        self.inflation_decay = inflation_decay
+        self.inflation_hard_cap = inflation_hard_cap
+        self.inflation_soft_cap = inflation_soft_cap
 
     def place(self, benchmark: Benchmark) -> torch.Tensor:
         log_dir = Path("logs")
@@ -950,8 +1039,8 @@ class HybridAnalyticalPlacer:
             top_k_candidates.append((initial_proxy, -1, placement.detach().clone()))
 
         start_time = time()
-        total_time_budget = 900
-        hard_time_budget = 1200
+        total_time_budget = 1800
+        hard_time_budget = 2400
         min_stage_budget = 120
         nesterov_time_budget = 240
         step = 0
@@ -1000,6 +1089,12 @@ class HybridAnalyticalPlacer:
         # catches regressions.
         cong_weight_hard = 0.0015
         cong_weight_soft = 0.004
+
+        # RePlAce routability inflation: per-macro effective size scaled
+        # by current routing-pressure at its bin. Updated periodically;
+        # used in density grid computation to bias Nesterov gradient.
+        macro_inflation = torch.ones(num_all, dtype=torch.float32)
+
         for step in range(self.num_steps):
             progress = step / self.num_steps
             current_lr = base_lr * (0.5 * (1 + math.cos(math.pi * progress)))
@@ -1019,26 +1114,71 @@ class HybridAnalyticalPlacer:
                     moved = (placement[:num_hard] - old_pos).abs().sum(dim=1) > 1e-4
                     velocity[:num_hard][moved] = 0.0
 
-            # 1. WL gradient at lookahead
+            # 1. WL gradient at lookahead (+ optionally smooth-density loss
+            # combined in the same backward pass so we get a structurally
+            # correct gradient toward the TILOS-aligned objective).
             lookahead = placement.clone()
             lookahead[:num_hard] = placement[:num_hard] + self.momentum * velocity[:num_hard]
             lookahead.requires_grad_(True)
-            loss, wl = self._compute_wl_loss(
+            wl_loss, wl = self._compute_wl_loss(
                 lookahead, net_indices, net_mask, nets, canvas_norm, net_weights=net_weights
             )
-            loss.backward()
+            if self.use_smooth_density:
+                # Replaces the Poisson-based L2-spread force with a smooth
+                # top-frac mean of bin densities — matches the TILOS density
+                # cost shape and lets autograd compute structurally correct
+                # gradients (no more "minimize surrogate while real cost diverges").
+                smooth_dens = self._compute_smooth_density_loss(
+                    lookahead, benchmark,
+                    frac=self.smooth_density_frac,
+                    tau=self.smooth_density_tau,
+                    hard_weight=1.0,
+                    soft_weight=self.smooth_density_soft_scale,
+                )
+                total_loss = wl_loss + self.smooth_density_weight * smooth_dens
+            else:
+                total_loss = wl_loss
+            total_loss.backward()
             wl_grad = lookahead.grad.detach().clone()
             lookahead.requires_grad_(False)
 
-            grid = self._compute_density_grid_fast(placement, benchmark)
+            # Build density grid with current per-macro inflation factors.
+            # Inflated macros project a larger footprint into hot bins →
+            # Poisson force pushes them out more aggressively.
+            inflation_arg = macro_inflation if self.use_routability_inflation else 1.0
+            grid = self._compute_density_grid_fast(placement, benchmark, inflation=inflation_arg)
             if step % 500 == 0:
                 rudy = self._compute_rudy_map(placement, benchmark, nets, net_indices, net_mask)
                 # Lower density target where congestion is high
                 target_grid = grid.mean() - 0.1 * (rudy / rudy.max())
-            # 2. Density forces at current position
-            density_forces = self._compute_density_force_fast(
-                self._solve_poisson(grid, target_grid), placement, benchmark
-            )
+            # 2. Density forces at current position (LEGACY — only used when
+            # use_smooth_density=False; otherwise the smooth-density gradient
+            # is already baked into wl_grad above).
+            if self.use_smooth_density:
+                density_forces = torch.zeros_like(placement)
+            else:
+                density_forces = self._compute_density_force_fast(
+                    self._solve_poisson(grid, target_grid), placement, benchmark
+                )
+
+            # Refresh inflation factors periodically.
+            if (
+                self.use_routability_inflation
+                and plc is not None
+                and step > 0
+                and step % self.inflation_update_every == 0
+            ):
+                rudy_now = self._compute_rudy_map(
+                    placement, benchmark, nets, net_indices, net_mask
+                )
+                rudy_norm = rudy_now / (rudy_now.mean() + 1e-6)
+                macro_inflation = self._update_routability_inflation(
+                    macro_inflation, placement, benchmark, rudy_norm, grid, step,
+                    growth=self.inflation_growth,
+                    decay=self.inflation_decay,
+                    hard_cap=self.inflation_hard_cap,
+                    soft_cap=self.inflation_soft_cap,
+                )
 
             # 2b. HV-cong gradient (DISABLED — see comment above for revert
             # reason. Re-enable by uncommenting the block AND the two
@@ -2557,13 +2697,85 @@ class HybridAnalyticalPlacer:
             placement = placement.detach()
         return placement
 
-    def _compute_density_grid_fast(
-        self, placement: torch.Tensor, benchmark: Benchmark, inflation: float = 1.0
+    def _compute_smooth_density_loss(
+        self,
+        placement: torch.Tensor,
+        benchmark: Benchmark,
+        frac: float = 0.10,
+        tau: float = 0.05,
+        hard_weight: float = 1.0,
+        soft_weight: float = 10.0,
     ) -> torch.Tensor:
+        """
+        Differentiable smooth approximation of TILOS density cost.
+
+        TILOS scores: 0.5 * mean(top frac × #bins). Replacing this with a
+        sigmoid-gated weighted average that's differentiable in macro
+        positions. Threshold is detached (gradient flows through values
+        only). As tau → 0 this recovers the exact top-frac mean;
+        practical tau ~ 0.05 keeps the gradient signal smooth.
+
+        We weight HARD macro contributions to the grid differently from
+        SOFT — soft macros have ~10× more headroom to spread.
+        """
+        num_hard = benchmark.num_hard_macros
+        num_macros = benchmark.num_macros
+        sizes = benchmark.macro_sizes[:num_macros]
+        cx = placement[:num_macros, 0]
+        cy = placement[:num_macros, 1]
+        half_w = sizes[:, 0] / 2
+        half_h = sizes[:, 1] / 2
+        left = cx - half_w
+        right = cx + half_w
+        bottom = cy - half_h
+        top = cy + half_h
+        overlap_x = torch.clamp(
+            torch.min(right.unsqueeze(1), self._bin_right.unsqueeze(0))
+            - torch.max(left.unsqueeze(1), self._bin_left.unsqueeze(0)),
+            min=0,
+        )
+        overlap_y = torch.clamp(
+            torch.min(top.unsqueeze(1), self._bin_top.unsqueeze(0))
+            - torch.max(bottom.unsqueeze(1), self._bin_bottom.unsqueeze(0)),
+            min=0,
+        )
+        # Apply per-macro weight to its grid contribution.
+        per_macro_w = torch.ones(num_macros, dtype=placement.dtype, device=placement.device)
+        per_macro_w[num_hard:] = soft_weight
+        per_macro_w[:num_hard] = hard_weight
+        # Weight along the macro axis: contribution = w_m * overlap_y[m] outer overlap_x[m]
+        # We compute via element-wise scale before the mm.
+        oy_w = overlap_y * per_macro_w.unsqueeze(1)
+        grid = torch.mm(oy_w.t(), overlap_x) / (self._bin_w * self._bin_h)
+        grid_flat = grid.flatten()
+        threshold = torch.quantile(grid_flat.detach(), 1.0 - frac)
+        weights = torch.sigmoid((grid_flat - threshold) / tau)
+        soft_top_mean = (weights * grid_flat).sum() / (weights.sum() + 1e-8)
+        return 0.5 * soft_top_mean
+
+    def _compute_density_grid_fast(
+        self,
+        placement: torch.Tensor,
+        benchmark: Benchmark,
+        inflation=1.0,
+    ) -> torch.Tensor:
+        """
+        Bin-overlap density grid. `inflation` may be a scalar (applied to hard
+        macros only) OR a per-macro 1D tensor of size num_macros (each macro's
+        effective size scaled by its own factor). The per-macro form is what
+        the RePlAce-style routability inflation uses to push macros out of
+        congested bins.
+        """
         num_macros = benchmark.num_macros
         sizes = benchmark.macro_sizes[:num_macros]
 
-        if inflation != 1.0:
+        if torch.is_tensor(inflation):
+            if inflation.numel() != num_macros:
+                raise ValueError(
+                    f"per-macro inflation tensor size {inflation.numel()} != num_macros {num_macros}"
+                )
+            sizes = sizes * inflation.unsqueeze(1)
+        elif inflation != 1.0:
             inflated = sizes.clone()
             inflated[: benchmark.num_hard_macros] *= inflation
             sizes = inflated
@@ -2588,6 +2800,91 @@ class HybridAnalyticalPlacer:
             min=0,
         )
         return torch.mm(overlap_y.t(), overlap_x) / (self._bin_w * self._bin_h)
+
+    def _update_routability_inflation(
+        self,
+        macro_inflation: torch.Tensor,
+        placement: torch.Tensor,
+        benchmark: Benchmark,
+        rudy_norm: torch.Tensor,
+        density_grid: torch.Tensor,
+        step: int,
+        growth: float = 0.030,
+        decay: float = 0.040,
+        hard_cap: float = 1.28,
+        soft_cap: float = 1.55,
+        growth_until: int = 3000,
+    ) -> torch.Tensor:
+        """
+        RePlAce-style routability inflation (Cheng et al., TCAD 2018; ported
+        from hap2 where it contributed to ~1.315 overall).
+
+        Macros sitting in high routing-pressure bins get their EFFECTIVE
+        density size grown (multiplicative, with cap). This biases Nesterov's
+        density gradient to push them OUT of those bins → opens routing
+        channels → cong drops. Decay shrinks inflation when pressure clears
+        so macros aren't artificially large forever.
+
+        Behavior:
+          - Grow phase (step <= growth_until): hot bins → inflate, cool bins → decay
+          - Decay-only phase (step > growth_until): never grow, just shrink
+          - Hard macros capped tighter (1.28×) than soft (1.55×) since soft is
+            the routing sea — the user's observed problem
+          - Fixed macros never inflate
+        """
+        num_all = benchmark.num_macros
+        num_hard = benchmark.num_hard_macros
+        if num_all == 0:
+            return macro_inflation
+
+        density_norm = density_grid / (density_grid.mean() + 1e-6)
+        pressure_grid = rudy_norm.clamp(max=8.0) + 0.35 * density_norm.clamp(max=8.0)
+        hot = torch.quantile(pressure_grid.flatten(), 0.82).clamp(min=1.05)
+        very_hot = torch.quantile(pressure_grid.flatten(), 0.94).clamp(min=hot + 1e-4)
+
+        cx = placement[:num_all, 0].detach()
+        cy = placement[:num_all, 1].detach()
+        c_bins = (cx / self._bin_w).long().clamp(0, benchmark.grid_cols - 1)
+        r_bins = (cy / self._bin_h).long().clamp(0, benchmark.grid_rows - 1)
+        macro_pressure = pressure_grid[r_bins, c_bins]
+
+        new_inflation = macro_inflation.detach().clone()
+        hot_mask = macro_pressure > hot
+        allow_growth = step <= growth_until
+        if hot_mask.any() and allow_growth:
+            severity = ((macro_pressure[hot_mask] - hot) / (very_hot - hot + 1e-6)).clamp(0.0, 2.0)
+            multiplier = 1.0 + growth * (0.7 + severity)
+            new_inflation[hot_mask] *= multiplier
+        elif hot_mask.any():
+            # Decay-only phase: even hot bins shrink, just more slowly
+            new_inflation[hot_mask] = 1.0 + (new_inflation[hot_mask] - 1.0) * (1.0 - decay * 0.45)
+
+        cool_mask = ~hot_mask if allow_growth else torch.ones_like(hot_mask, dtype=torch.bool)
+        if cool_mask.any():
+            new_inflation[cool_mask] = 1.0 + (new_inflation[cool_mask] - 1.0) * (1.0 - decay)
+
+        if num_hard > 0:
+            new_inflation[:num_hard].clamp_(1.0, hard_cap)
+        if num_all > num_hard:
+            # Soft clusters are the routing sea; give them more room to spread.
+            soft_hot = hot_mask[num_hard:num_all]
+            soft_inflation = new_inflation[num_hard:num_all].clone()
+            if soft_hot.any() and allow_growth:
+                soft_inflation[soft_hot] *= 1.0 + growth * 0.35
+            new_inflation[num_hard:num_all] = soft_inflation.clamp(1.0, soft_cap)
+
+        if benchmark.macro_fixed.any():
+            new_inflation[benchmark.macro_fixed[:num_all]] = 1.0
+
+        if self.verbose and step % 600 == 0:
+            print(
+                f"  [inflate {step:5d}] hot={int(hot_mask.sum().item())}/{num_all} "
+                f"mean={new_inflation.mean().item():.3f} "
+                f"hard_max={new_inflation[:num_hard].max().item() if num_hard else 1.0:.2f} "
+                f"soft_max={new_inflation[num_hard:num_all].max().item() if num_all > num_hard else 1.0:.2f} "
+                f"growth={'on' if allow_growth else 'off'}"
+            )
+        return new_inflation.detach()
 
     def _solve_poisson(self, density_grid: torch.Tensor, target_grid=None) -> torch.Tensor:
         if target_grid is None:
