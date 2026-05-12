@@ -9,7 +9,21 @@ Run via:
     uv run evaluate placer.py --all
 """
 
-from submissions.hybridv2 import HybridAnalyticalPlacerV2
+import importlib.util
+import os
+
+# Load the implementation file by path (the eval harness loads this `placer.py`
+# standalone, so `from submissions.hybridv2 import ...` doesn't resolve).
+_HV2_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "submissions",
+    "hybridv2.py",
+)
+_spec = importlib.util.spec_from_file_location("_hv2_impl", _HV2_PATH)
+_mod = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_mod)
+
+HybridAnalyticalPlacerV2 = _mod.HybridAnalyticalPlacerV2
 
 
 class Placer(HybridAnalyticalPlacerV2):
