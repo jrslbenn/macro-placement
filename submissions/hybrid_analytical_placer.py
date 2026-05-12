@@ -588,6 +588,174 @@ def _add_net_route_hv(
 
 
 @njit
+def _add_net_route_pin_hv(
+    h_grid, v_grid, net_idx,
+    pin_owner_np, pin_mask_np, pin_xoff_np, pin_yoff_np,
+    pin_fixed_x_np, pin_fixed_y_np, nw_np, pos,
+    macro_i, override_x, override_y,
+    bin_w, bin_h, n_rows, n_cols, hcap, vcap, sign,
+):
+    """Pin-level star+L routing — matches TILOS's modules_w_pins iteration
+    more accurately than macro-center routing. Routes from actual pin
+    positions (macro_pos + pin_offset for macros, fixed_xy for I/O ports).
+    On ibm01 initial: macro-center cong ratio 1.16 → pin-level 0.96."""
+    max_degree = pin_owner_np.shape[1]
+    rows = np.empty(max_degree, dtype=np.int32)
+    cols = np.empty(max_degree, dtype=np.int32)
+    count = 0
+    src_r = 0
+    src_c = 0
+    source_seen = False
+    weight = nw_np[net_idx]
+
+    for d in range(max_degree):
+        if not pin_mask_np[net_idx, d]:
+            break
+        owner = pin_owner_np[net_idx, d]
+        if owner >= 0:
+            # Macro pin: position = macro_pos + offset (override for incr updates)
+            if owner == macro_i and override_x >= 0.0:
+                x = override_x + pin_xoff_np[net_idx, d]
+                y = override_y + pin_yoff_np[net_idx, d]
+            else:
+                x = pos[owner, 0] + pin_xoff_np[net_idx, d]
+                y = pos[owner, 1] + pin_yoff_np[net_idx, d]
+        else:
+            # Port pin: fixed position
+            x = pin_fixed_x_np[net_idx, d]
+            y = pin_fixed_y_np[net_idx, d]
+        r, c = _grid_cell_from_xy(x, y, bin_w, bin_h, n_rows, n_cols)
+        if not source_seen:
+            src_r = r
+            src_c = c
+            source_seen = True
+        duplicate = False
+        for k in range(count):
+            if rows[k] == r and cols[k] == c:
+                duplicate = True
+                break
+        if not duplicate:
+            rows[count] = r
+            cols[count] = c
+            count += 1
+
+    if count == 2:
+        if rows[0] == src_r and cols[0] == src_c:
+            tr = rows[1]
+            tc = cols[1]
+        else:
+            tr = rows[0]
+            tc = cols[0]
+        _add_two_pin_route_hv(h_grid, v_grid, src_r, src_c, tr, tc, weight, hcap, vcap, sign, n_rows, n_cols)
+    elif count == 3:
+        _add_three_pin_route_hv(h_grid, v_grid, rows, cols, weight, hcap, vcap, sign, n_rows, n_cols)
+    elif count > 3:
+        for k in range(count):
+            if rows[k] == src_r and cols[k] == src_c:
+                continue
+            _add_two_pin_route_hv(
+                h_grid, v_grid, src_r, src_c, rows[k], cols[k],
+                weight, hcap, vcap, sign, n_rows, n_cols,
+            )
+
+
+@njit
+def _build_pin_hv_route_grid(
+    h_grid, v_grid,
+    pin_owner_np, pin_mask_np, pin_xoff_np, pin_yoff_np,
+    pin_fixed_x_np, pin_fixed_y_np, nw_np, pos, num_nets,
+    bin_w, bin_h, n_rows, n_cols, hcap, vcap,
+):
+    for n in range(num_nets):
+        _add_net_route_pin_hv(
+            h_grid, v_grid, n,
+            pin_owner_np, pin_mask_np, pin_xoff_np, pin_yoff_np,
+            pin_fixed_x_np, pin_fixed_y_np, nw_np, pos,
+            -1, -1.0, -1.0,
+            bin_w, bin_h, n_rows, n_cols, hcap, vcap, 1.0,
+        )
+
+
+@njit
+def _update_pin_hv_route_incr_single(
+    h_grid, v_grid,
+    pin_owner_np, pin_mask_np, pin_xoff_np, pin_yoff_np,
+    pin_fixed_x_np, pin_fixed_y_np, nw_np, pos, affected_nets,
+    macro_i, old_x, old_y,
+    bin_w, bin_h, n_rows, n_cols, hcap, vcap,
+):
+    """Pin-level incremental routing update for single macro displacement."""
+    for k in range(len(affected_nets)):
+        n = affected_nets[k]
+        _add_net_route_pin_hv(
+            h_grid, v_grid, n,
+            pin_owner_np, pin_mask_np, pin_xoff_np, pin_yoff_np,
+            pin_fixed_x_np, pin_fixed_y_np, nw_np, pos, macro_i, old_x, old_y,
+            bin_w, bin_h, n_rows, n_cols, hcap, vcap, -1.0,
+        )
+        _add_net_route_pin_hv(
+            h_grid, v_grid, n,
+            pin_owner_np, pin_mask_np, pin_xoff_np, pin_yoff_np,
+            pin_fixed_x_np, pin_fixed_y_np, nw_np, pos, -1, -1.0, -1.0,
+            bin_w, bin_h, n_rows, n_cols, hcap, vcap, 1.0,
+        )
+
+
+def build_pin_route_tensors(benchmark):
+    """
+    Pre-process benchmark.net_pin_nodes + macro_pin_offsets + port_positions
+    into padded numpy arrays for numba-friendly pin-level routing.
+
+    Returns (pin_owner, pin_mask, pin_xoff, pin_yoff, pin_fixed_x, pin_fixed_y, nw)
+    or None if pin data isn't populated.
+    """
+    nets = benchmark.net_pin_nodes
+    if not nets:
+        return None
+    # Keep all nets indexed positionally — downstream code uses the same
+    # net_idx → caller's macro_to_nets mapping. Nets with <2 pins just get
+    # mask=False and contribute nothing to routing.
+    max_pins = max((t.shape[0] for t in nets), default=0)
+    if max_pins == 0:
+        return None
+    num_nets = len(nets)
+    pin_owner = np.full((num_nets, max_pins), -1, dtype=np.int32)
+    pin_xoff = np.zeros((num_nets, max_pins), dtype=np.float32)
+    pin_yoff = np.zeros((num_nets, max_pins), dtype=np.float32)
+    pin_fixed_x = np.zeros((num_nets, max_pins), dtype=np.float32)
+    pin_fixed_y = np.zeros((num_nets, max_pins), dtype=np.float32)
+    pin_mask = np.zeros((num_nets, max_pins), dtype=np.bool_)
+    nw = np.ones(num_nets, dtype=np.float32)
+    num_hard = benchmark.num_hard_macros
+    num_macros = benchmark.num_macros
+    port_positions = (
+        benchmark.port_positions.numpy() if benchmark.port_positions.numel() else None
+    )
+    macro_pin_offsets = [t.numpy() for t in benchmark.macro_pin_offsets]
+    for ni, net_t in enumerate(nets):
+        if net_t.shape[0] < 2:
+            continue
+        arr = net_t.numpy()
+        for d in range(arr.shape[0]):
+            owner = int(arr[d, 0])
+            pin_idx = int(arr[d, 1])
+            pin_mask[ni, d] = True
+            if owner < num_hard:
+                pin_owner[ni, d] = owner
+                off = macro_pin_offsets[owner][pin_idx]
+                pin_xoff[ni, d] = float(off[0])
+                pin_yoff[ni, d] = float(off[1])
+            elif owner < num_macros:
+                pin_owner[ni, d] = owner
+            elif port_positions is not None:
+                pin_owner[ni, d] = -1
+                pidx = owner - num_macros
+                pin_fixed_x[ni, d] = float(port_positions[pidx, 0])
+                pin_fixed_y[ni, d] = float(port_positions[pidx, 1])
+    return pin_owner, pin_mask, pin_xoff, pin_yoff, pin_fixed_x, pin_fixed_y, nw
+
+
+@njit
 def _build_hv_route_grid(
     h_grid, v_grid, ni_np, nm_np, nw_np, pos, num_nets,
     bin_w, bin_h, n_rows, n_cols, hcap, vcap,
