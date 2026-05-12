@@ -701,6 +701,33 @@ def _update_pin_hv_route_incr_single(
         )
 
 
+def build_macro_to_pin_nets(benchmark, num_all_macros):
+    """
+    Inverted index: macro index → list of net indices that contain any pin
+    owned by this macro. Indexed against benchmark.net_pin_nodes positionally
+    (so use with `pin_owner` etc. from build_pin_route_tensors).
+
+    Differs from the macro_to_nets built from net_indices (parent's deduped
+    macro graph): pin nets include ALL nets ≥2 pins, even single-macro nets
+    that the macro-level dedupe drops.
+    """
+    nets = benchmark.net_pin_nodes
+    if not nets:
+        return None
+    out = [[] for _ in range(num_all_macros)]
+    for ni, net_t in enumerate(nets):
+        if net_t.shape[0] < 2:
+            continue
+        arr = net_t.numpy()
+        seen = set()
+        for d in range(arr.shape[0]):
+            owner = int(arr[d, 0])
+            if 0 <= owner < num_all_macros and owner not in seen:
+                out[owner].append(ni)
+                seen.add(owner)
+    return [np.array(v, dtype=np.int32) for v in out]
+
+
 def build_pin_route_tensors(benchmark):
     """
     Pre-process benchmark.net_pin_nodes + macro_pin_offsets + port_positions
@@ -1764,10 +1791,24 @@ class HybridAnalyticalPlacer:
             v_route_grid = np.zeros((n_rows, n_cols), dtype=np.float32)
             h_macro_grid = np.zeros((n_rows, n_cols), dtype=np.float32)
             v_macro_grid = np.zeros((n_rows, n_cols), dtype=np.float32)
-            _build_hv_route_grid(
-                h_route_grid, v_route_grid, ni_np, nm_np, nw_np, sa_pos, num_nets,
-                bin_w, bin_h, n_rows, n_cols, hcap, vcap,
-            )
+            # Pin-level routing model (matches TILOS modules_w_pins iteration).
+            # Falls back to macro-center if pin data missing.
+            _pin_tensors = build_pin_route_tensors(benchmark)
+            _use_pin_routing = _pin_tensors is not None
+            if _use_pin_routing:
+                pin_owner_p, pin_mask_p, pin_xoff_p, pin_yoff_p, pin_fx_p, pin_fy_p, nw_p = _pin_tensors
+                macro_to_pin_nets = build_macro_to_pin_nets(benchmark, num_all)
+                num_pin_nets = pin_owner_p.shape[0]
+                _build_pin_hv_route_grid(
+                    h_route_grid, v_route_grid,
+                    pin_owner_p, pin_mask_p, pin_xoff_p, pin_yoff_p, pin_fx_p, pin_fy_p, nw_p,
+                    sa_pos, num_pin_nets, bin_w, bin_h, n_rows, n_cols, hcap, vcap,
+                )
+            else:
+                _build_hv_route_grid(
+                    h_route_grid, v_route_grid, ni_np, nm_np, nw_np, sa_pos, num_nets,
+                    bin_w, bin_h, n_rows, n_cols, hcap, vcap,
+                )
             _build_macro_route_grid(
                 h_macro_grid, v_macro_grid, sa_pos, sizes_np, num_hard, bl, br, bb, bt,
                 n_rows, n_cols, bin_w, bin_h, hcap, vcap, h_alloc, v_alloc,
@@ -1807,7 +1848,14 @@ class HybridAnalyticalPlacer:
                     v_route_grid[:] = 0
                     h_macro_grid[:] = 0
                     v_macro_grid[:] = 0
-                    _build_hv_route_grid(h_route_grid, v_route_grid, ni_np, nm_np, nw_np, sa_pos, num_nets, bin_w, bin_h, n_rows, n_cols, hcap, vcap)
+                    if _use_pin_routing:
+                        _build_pin_hv_route_grid(
+                            h_route_grid, v_route_grid,
+                            pin_owner_p, pin_mask_p, pin_xoff_p, pin_yoff_p, pin_fx_p, pin_fy_p, nw_p,
+                            sa_pos, num_pin_nets, bin_w, bin_h, n_rows, n_cols, hcap, vcap,
+                        )
+                    else:
+                        _build_hv_route_grid(h_route_grid, v_route_grid, ni_np, nm_np, nw_np, sa_pos, num_nets, bin_w, bin_h, n_rows, n_cols, hcap, vcap)
                     _build_macro_route_grid(h_macro_grid, v_macro_grid, sa_pos, sizes_np, num_hard, bl, br, bb, bt, n_rows, n_cols, bin_w, bin_h, hcap, vcap, h_alloc, v_alloc)
                     current_den = _density_cost_top5(density_grid)
                     current_cong = _hv_congestion_cost_top5(h_route_grid, v_route_grid, h_macro_grid, v_macro_grid, smooth_range)
@@ -1862,7 +1910,17 @@ class HybridAnalyticalPlacer:
 
                 # Incremental HV routing update (nets touching i) +
                 # macro blockage update (i moved).
-                _update_hv_route_incr_single(h_route_grid, v_route_grid, ni_np, nm_np, nw_np, sa_pos, aff, i, old_x, old_y, bin_w, bin_h, n_rows, n_cols, hcap, vcap)
+                if _use_pin_routing:
+                    pin_aff = macro_to_pin_nets[i]
+                    if len(pin_aff) > 0:
+                        _update_pin_hv_route_incr_single(
+                            h_route_grid, v_route_grid,
+                            pin_owner_p, pin_mask_p, pin_xoff_p, pin_yoff_p, pin_fx_p, pin_fy_p, nw_p,
+                            sa_pos, pin_aff, i, old_x, old_y,
+                            bin_w, bin_h, n_rows, n_cols, hcap, vcap,
+                        )
+                else:
+                    _update_hv_route_incr_single(h_route_grid, v_route_grid, ni_np, nm_np, nw_np, sa_pos, aff, i, old_x, old_y, bin_w, bin_h, n_rows, n_cols, hcap, vcap)
                 _update_macro_route_incr_single(h_macro_grid, v_macro_grid, old_x, old_y, new_x, new_y, hw_np[i], hh_np[i], bl, br, bb, bt, n_rows, n_cols, bin_w, bin_h, hcap, vcap, h_alloc, v_alloc)
                 new_cong = _hv_congestion_cost_top5(h_route_grid, v_route_grid, h_macro_grid, v_macro_grid, smooth_range)
 
@@ -1907,7 +1965,14 @@ class HybridAnalyticalPlacer:
                             v_route_grid[:] = 0
                             h_macro_grid[:] = 0
                             v_macro_grid[:] = 0
-                            _build_hv_route_grid(h_route_grid, v_route_grid, ni_np, nm_np, nw_np, sa_pos, num_nets, bin_w, bin_h, n_rows, n_cols, hcap, vcap)
+                            if _use_pin_routing:
+                                _build_pin_hv_route_grid(
+                                    h_route_grid, v_route_grid,
+                                    pin_owner_p, pin_mask_p, pin_xoff_p, pin_yoff_p, pin_fx_p, pin_fy_p, nw_p,
+                                    sa_pos, num_pin_nets, bin_w, bin_h, n_rows, n_cols, hcap, vcap,
+                                )
+                            else:
+                                _build_hv_route_grid(h_route_grid, v_route_grid, ni_np, nm_np, nw_np, sa_pos, num_nets, bin_w, bin_h, n_rows, n_cols, hcap, vcap)
                             _build_macro_route_grid(h_macro_grid, v_macro_grid, sa_pos, sizes_np, num_hard, bl, br, bb, bt, n_rows, n_cols, bin_w, bin_h, hcap, vcap, h_alloc, v_alloc)
                             current_den = _density_cost_top5(density_grid)
                             current_cong = _hv_congestion_cost_top5(h_route_grid, v_route_grid, h_macro_grid, v_macro_grid, smooth_range)
@@ -1931,7 +1996,17 @@ class HybridAnalyticalPlacer:
                                         hw_np[i], hh_np[i], bl, br, bb, bt, bin_area, n_rows, n_cols, bin_w, bin_h)
                     # Reverse the HV updates: pass new_x/new_y as "old" so
                     # subtract uses new, add uses old (which is now in sa_pos).
-                    _update_hv_route_incr_single(h_route_grid, v_route_grid, ni_np, nm_np, nw_np, sa_pos, aff, i, new_x, new_y, bin_w, bin_h, n_rows, n_cols, hcap, vcap)
+                    if _use_pin_routing:
+                        pin_aff = macro_to_pin_nets[i]
+                        if len(pin_aff) > 0:
+                            _update_pin_hv_route_incr_single(
+                                h_route_grid, v_route_grid,
+                                pin_owner_p, pin_mask_p, pin_xoff_p, pin_yoff_p, pin_fx_p, pin_fy_p, nw_p,
+                                sa_pos, pin_aff, i, new_x, new_y,
+                                bin_w, bin_h, n_rows, n_cols, hcap, vcap,
+                            )
+                    else:
+                        _update_hv_route_incr_single(h_route_grid, v_route_grid, ni_np, nm_np, nw_np, sa_pos, aff, i, new_x, new_y, bin_w, bin_h, n_rows, n_cols, hcap, vcap)
                     _update_macro_route_incr_single(h_macro_grid, v_macro_grid, new_x, new_y, old_x, old_y, hw_np[i], hh_np[i], bl, br, bb, bt, n_rows, n_cols, bin_w, bin_h, hcap, vcap, h_alloc, v_alloc)
 
                 if total - last_accept_step > 5_000_000:
