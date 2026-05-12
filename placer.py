@@ -1,5 +1,5 @@
 """
-Canonical entry point for the SPIRAL Placer submission.
+Canonical entry point for the HAPpy Placer submission.
 
 The competition eval expects a `Placer` class with a `place(benchmark)` method.
 This thin shim re-exports the full pipeline implemented in
@@ -27,5 +27,5 @@ HybridAnalyticalPlacerV2 = _mod.HybridAnalyticalPlacerV2
 
 
 class Placer(HybridAnalyticalPlacerV2):
-    """SPIRAL Placer — pipeline detailed in README.md."""
+    """HAPpy Placer — pipeline detailed in README.md."""
     pass
