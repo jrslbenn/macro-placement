@@ -50,6 +50,11 @@ _update_density_incr = _parent_mod._update_density_incr
 _density_cost_top5 = _parent_mod._density_cost_top5
 _hpwl_batch = _parent_mod._hpwl_batch
 ProgressGate = _parent_mod.ProgressGate
+# Pin-level routing helpers (TILOS-faithful — closes cong calibration drift).
+_build_pin_hv_route_grid = _parent_mod._build_pin_hv_route_grid
+_update_pin_hv_route_incr_single = _parent_mod._update_pin_hv_route_incr_single
+build_pin_route_tensors = _parent_mod.build_pin_route_tensors
+build_macro_to_pin_nets = _parent_mod.build_macro_to_pin_nets
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -763,10 +768,31 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
             density_grid, pos, sizes, num_all, bl, br, bb, bt, bin_area,
             n_rows, n_cols, bin_w, bin_h,
         )
-        _build_hv_route_grid(
-            h_route_grid, v_route_grid, ni_np, nm_np, nw_np, pos, ni_np.shape[0],
-            bin_w, bin_h, n_rows, n_cols, hcap, vcap,
-        )
+        # Pin-level routing matches TILOS — closes cong calibration drift.
+        # Falls back to macro-center routing if pin data missing.
+        _pin_tensors = build_pin_route_tensors(benchmark)
+        _use_pin_routing = _pin_tensors is not None
+        if _use_pin_routing:
+            pin_owner_p, pin_mask_p, pin_xoff_p, pin_yoff_p, pin_fx_p, pin_fy_p, nw_p = _pin_tensors
+            macro_to_pin_nets = build_macro_to_pin_nets(benchmark, num_all)
+            num_pin_nets = pin_owner_p.shape[0]
+            _build_pin_hv_route_grid(
+                h_route_grid, v_route_grid,
+                pin_owner_p, pin_mask_p, pin_xoff_p, pin_yoff_p, pin_fx_p, pin_fy_p, nw_p,
+                pos, num_pin_nets, bin_w, bin_h, n_rows, n_cols, hcap, vcap,
+            )
+        else:
+            if _use_pin_routing:
+                _build_pin_hv_route_grid(
+                    h_route_grid, v_route_grid,
+                    pin_owner_p, pin_mask_p, pin_xoff_p, pin_yoff_p, pin_fx_p, pin_fy_p, nw_p,
+                    pos, num_pin_nets, bin_w, bin_h, n_rows, n_cols, hcap, vcap,
+                )
+            else:
+                _build_hv_route_grid(
+                    h_route_grid, v_route_grid, ni_np, nm_np, nw_np, pos, ni_np.shape[0],
+                    bin_w, bin_h, n_rows, n_cols, hcap, vcap,
+                )
         _build_macro_route_grid(
             h_macro_grid, v_macro_grid, pos, sizes, num_hard, bl, br, bb, bt,
             n_rows, n_cols, bin_w, bin_h, hcap, vcap, h_alloc, v_alloc,
@@ -899,10 +925,17 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
                 density_grid, pos, sizes, num_all, bl, br, bb, bt, bin_area,
                 n_rows, n_cols, bin_w, bin_h,
             )
-            _build_hv_route_grid(
-                h_route_grid, v_route_grid, ni_np, nm_np, nw_np, pos, ni_np.shape[0],
-                bin_w, bin_h, n_rows, n_cols, hcap, vcap,
-            )
+            if _use_pin_routing:
+                _build_pin_hv_route_grid(
+                    h_route_grid, v_route_grid,
+                    pin_owner_p, pin_mask_p, pin_xoff_p, pin_yoff_p, pin_fx_p, pin_fy_p, nw_p,
+                    pos, num_pin_nets, bin_w, bin_h, n_rows, n_cols, hcap, vcap,
+                )
+            else:
+                _build_hv_route_grid(
+                    h_route_grid, v_route_grid, ni_np, nm_np, nw_np, pos, ni_np.shape[0],
+                    bin_w, bin_h, n_rows, n_cols, hcap, vcap,
+                )
             _build_macro_route_grid(
                 h_macro_grid, v_macro_grid, pos, sizes, num_hard, bl, br, bb, bt,
                 n_rows, n_cols, bin_w, bin_h, hcap, vcap, h_alloc, v_alloc,
@@ -1054,12 +1087,22 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
                         bl, br, bb, bt, n_rows, n_cols, bin_w, bin_h,
                         hcap, vcap, h_alloc, v_alloc,
                     )
-                    if len(aff):
+                    if _use_pin_routing:
+                        pin_aff = macro_to_pin_nets[macro_idx]
+                        if len(pin_aff) > 0:
+                            _update_pin_hv_route_incr_single(
+                                h_route_grid, v_route_grid,
+                                pin_owner_p, pin_mask_p, pin_xoff_p, pin_yoff_p, pin_fx_p, pin_fy_p, nw_p,
+                                pos, pin_aff, macro_idx, old_x, old_y,
+                                bin_w, bin_h, n_rows, n_cols, hcap, vcap,
+                            )
+                    elif len(aff):
                         _update_hv_route_incr_single(
                             h_route_grid, v_route_grid, ni_np, nm_np, nw_np, pos, aff,
                             macro_idx, old_x, old_y,
                             bin_w, bin_h, n_rows, n_cols, hcap, vcap,
                         )
+                    if len(aff):
                         new_hpwl = _hpwl_batch(aff, ni_np, nm_np, pos)
                         wl_delta = float(((new_hpwl - old_hpwl) * nw_np[aff]).sum()) / (
                             num_nets * canvas_norm
@@ -1092,7 +1135,16 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
                         bl, br, bb, bt, n_rows, n_cols, bin_w, bin_h,
                         hcap, vcap, h_alloc, v_alloc,
                     )
-                    if len(aff):
+                    if _use_pin_routing:
+                        pin_aff = macro_to_pin_nets[macro_idx]
+                        if len(pin_aff) > 0:
+                            _update_pin_hv_route_incr_single(
+                                h_route_grid, v_route_grid,
+                                pin_owner_p, pin_mask_p, pin_xoff_p, pin_yoff_p, pin_fx_p, pin_fy_p, nw_p,
+                                pos, pin_aff, macro_idx, x, y,
+                                bin_w, bin_h, n_rows, n_cols, hcap, vcap,
+                            )
+                    elif len(aff):
                         _update_hv_route_incr_single(
                             h_route_grid, v_route_grid, ni_np, nm_np, nw_np, pos, aff,
                             macro_idx, x, y,
@@ -1126,12 +1178,22 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
                         bl, br, bb, bt, n_rows, n_cols, bin_w, bin_h,
                         hcap, vcap, h_alloc, v_alloc,
                     )
-                    if len(aff):
+                    if _use_pin_routing:
+                        pin_aff = macro_to_pin_nets[macro_idx]
+                        if len(pin_aff) > 0:
+                            _update_pin_hv_route_incr_single(
+                                h_route_grid, v_route_grid,
+                                pin_owner_p, pin_mask_p, pin_xoff_p, pin_yoff_p, pin_fx_p, pin_fy_p, nw_p,
+                                pos, pin_aff, macro_idx, old_x, old_y,
+                                bin_w, bin_h, n_rows, n_cols, hcap, vcap,
+                            )
+                    elif len(aff):
                         _update_hv_route_incr_single(
                             h_route_grid, v_route_grid, ni_np, nm_np, nw_np, pos, aff,
                             macro_idx, old_x, old_y,
                             bin_w, bin_h, n_rows, n_cols, hcap, vcap,
                         )
+                    if len(aff):
                         net_hpwl[aff] = new_hpwl
                     total_wl += wl_delta
                     current_den = new_den
@@ -1317,10 +1379,31 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
             density_grid, pos, sizes, num_all, bl, br, bb, bt, bin_area,
             n_rows, n_cols, bin_w, bin_h,
         )
-        _build_hv_route_grid(
-            h_route_grid, v_route_grid, ni_np, nm_np, nw_np, pos, ni_np.shape[0],
-            bin_w, bin_h, n_rows, n_cols, hcap, vcap,
-        )
+        # Pin-level routing matches TILOS — closes cong calibration drift.
+        # Falls back to macro-center routing if pin data missing.
+        _pin_tensors = build_pin_route_tensors(benchmark)
+        _use_pin_routing = _pin_tensors is not None
+        if _use_pin_routing:
+            pin_owner_p, pin_mask_p, pin_xoff_p, pin_yoff_p, pin_fx_p, pin_fy_p, nw_p = _pin_tensors
+            macro_to_pin_nets = build_macro_to_pin_nets(benchmark, num_all)
+            num_pin_nets = pin_owner_p.shape[0]
+            _build_pin_hv_route_grid(
+                h_route_grid, v_route_grid,
+                pin_owner_p, pin_mask_p, pin_xoff_p, pin_yoff_p, pin_fx_p, pin_fy_p, nw_p,
+                pos, num_pin_nets, bin_w, bin_h, n_rows, n_cols, hcap, vcap,
+            )
+        else:
+            if _use_pin_routing:
+                _build_pin_hv_route_grid(
+                    h_route_grid, v_route_grid,
+                    pin_owner_p, pin_mask_p, pin_xoff_p, pin_yoff_p, pin_fx_p, pin_fy_p, nw_p,
+                    pos, num_pin_nets, bin_w, bin_h, n_rows, n_cols, hcap, vcap,
+                )
+            else:
+                _build_hv_route_grid(
+                    h_route_grid, v_route_grid, ni_np, nm_np, nw_np, pos, ni_np.shape[0],
+                    bin_w, bin_h, n_rows, n_cols, hcap, vcap,
+                )
         _build_macro_route_grid(
             h_macro_grid, v_macro_grid, pos, sizes, num_hard, bl, br, bb, bt,
             n_rows, n_cols, bin_w, bin_h, hcap, vcap, h_alloc, v_alloc,
@@ -1388,10 +1471,17 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
                 density_grid, pos, sizes, num_all, bl, br, bb, bt, bin_area,
                 n_rows, n_cols, bin_w, bin_h,
             )
-            _build_hv_route_grid(
-                h_route_grid, v_route_grid, ni_np, nm_np, nw_np, pos, ni_np.shape[0],
-                bin_w, bin_h, n_rows, n_cols, hcap, vcap,
-            )
+            if _use_pin_routing:
+                _build_pin_hv_route_grid(
+                    h_route_grid, v_route_grid,
+                    pin_owner_p, pin_mask_p, pin_xoff_p, pin_yoff_p, pin_fx_p, pin_fy_p, nw_p,
+                    pos, num_pin_nets, bin_w, bin_h, n_rows, n_cols, hcap, vcap,
+                )
+            else:
+                _build_hv_route_grid(
+                    h_route_grid, v_route_grid, ni_np, nm_np, nw_np, pos, ni_np.shape[0],
+                    bin_w, bin_h, n_rows, n_cols, hcap, vcap,
+                )
             net_hpwl = _hpwl_batch(np.arange(ni_np.shape[0], dtype=np.int32), ni_np, nm_np, pos)
             total_wl = float((net_hpwl * nw_np).sum()) / (num_nets * canvas_norm)
             current_den = _density_cost_top5(density_grid)
@@ -1569,12 +1659,22 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
                         hw_np[macro_idx], hh_np[macro_idx],
                         bl, br, bb, bt, bin_area, n_rows, n_cols, bin_w, bin_h,
                     )
-                    if len(aff):
+                    if _use_pin_routing:
+                        pin_aff = macro_to_pin_nets[macro_idx]
+                        if len(pin_aff) > 0:
+                            _update_pin_hv_route_incr_single(
+                                h_route_grid, v_route_grid,
+                                pin_owner_p, pin_mask_p, pin_xoff_p, pin_yoff_p, pin_fx_p, pin_fy_p, nw_p,
+                                pos, pin_aff, macro_idx, old_x, old_y,
+                                bin_w, bin_h, n_rows, n_cols, hcap, vcap,
+                            )
+                    elif len(aff):
                         _update_hv_route_incr_single(
                             h_route_grid, v_route_grid, ni_np, nm_np, nw_np, pos, aff,
                             macro_idx, old_x, old_y,
                             bin_w, bin_h, n_rows, n_cols, hcap, vcap,
                         )
+                    if len(aff):
                         new_hpwl = _hpwl_batch(aff, ni_np, nm_np, pos)
                         wl_delta = float(((new_hpwl - old_hpwl) * nw_np[aff]).sum()) / (
                             num_nets * canvas_norm
@@ -1601,7 +1701,16 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
                         hw_np[macro_idx], hh_np[macro_idx],
                         bl, br, bb, bt, bin_area, n_rows, n_cols, bin_w, bin_h,
                     )
-                    if len(aff):
+                    if _use_pin_routing:
+                        pin_aff = macro_to_pin_nets[macro_idx]
+                        if len(pin_aff) > 0:
+                            _update_pin_hv_route_incr_single(
+                                h_route_grid, v_route_grid,
+                                pin_owner_p, pin_mask_p, pin_xoff_p, pin_yoff_p, pin_fx_p, pin_fy_p, nw_p,
+                                pos, pin_aff, macro_idx, x, y,
+                                bin_w, bin_h, n_rows, n_cols, hcap, vcap,
+                            )
+                    elif len(aff):
                         _update_hv_route_incr_single(
                             h_route_grid, v_route_grid, ni_np, nm_np, nw_np, pos, aff,
                             macro_idx, x, y,
@@ -1628,12 +1737,22 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
                         hw_np[macro_idx], hh_np[macro_idx],
                         bl, br, bb, bt, bin_area, n_rows, n_cols, bin_w, bin_h,
                     )
-                    if len(aff):
+                    if _use_pin_routing:
+                        pin_aff = macro_to_pin_nets[macro_idx]
+                        if len(pin_aff) > 0:
+                            _update_pin_hv_route_incr_single(
+                                h_route_grid, v_route_grid,
+                                pin_owner_p, pin_mask_p, pin_xoff_p, pin_yoff_p, pin_fx_p, pin_fy_p, nw_p,
+                                pos, pin_aff, macro_idx, old_x, old_y,
+                                bin_w, bin_h, n_rows, n_cols, hcap, vcap,
+                            )
+                    elif len(aff):
                         _update_hv_route_incr_single(
                             h_route_grid, v_route_grid, ni_np, nm_np, nw_np, pos, aff,
                             macro_idx, old_x, old_y,
                             bin_w, bin_h, n_rows, n_cols, hcap, vcap,
                         )
+                    if len(aff):
                         net_hpwl[aff] = new_hpwl
                     total_wl += wl_delta
                     current_den = new_den
