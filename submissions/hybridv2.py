@@ -43,6 +43,11 @@ _parent_spec = importlib.util.spec_from_file_location("_hap_parent", _PARENT_PAT
 _parent_mod = importlib.util.module_from_spec(_parent_spec)
 _parent_spec.loader.exec_module(_parent_mod)
 
+_IRE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "incremental_real_eval.py")
+_ire_spec = importlib.util.spec_from_file_location("_hap_incremental_real_eval", _IRE_PATH)
+_ire_mod = importlib.util.module_from_spec(_ire_spec)
+_ire_spec.loader.exec_module(_ire_mod)
+
 HybridAnalyticalPlacer = _parent_mod.HybridAnalyticalPlacer
 strong_legalize = _parent_mod.strong_legalize
 _build_density_grid = _parent_mod._build_density_grid
@@ -55,6 +60,16 @@ _build_pin_hv_route_grid = _parent_mod._build_pin_hv_route_grid
 _update_pin_hv_route_incr_single = _parent_mod._update_pin_hv_route_incr_single
 build_pin_route_tensors = _parent_mod.build_pin_route_tensors
 build_macro_to_pin_nets = _parent_mod.build_macro_to_pin_nets
+TopKMeanTracker = _ire_mod.TopKMeanTracker
+SmoothHVTopKTracker = _ire_mod.SmoothHVTopKTracker
+SmoothHVCostTracker = _ire_mod.SmoothHVCostTracker
+update_density_tracker_from_diff = _ire_mod.update_density_tracker_from_diff
+update_density_incr_tracked = _ire_mod.update_density_incr_tracked
+update_macro_route_incr_tracked = _ire_mod.update_macro_route_incr_tracked
+update_hv_route_incr_single_tracked = _ire_mod.update_hv_route_incr_single_tracked
+update_pin_hv_route_incr_single_tracked = _ire_mod.update_pin_hv_route_incr_single_tracked
+update_hv_route_incr_single_smooth = _ire_mod.update_hv_route_incr_single_smooth
+update_pin_hv_route_incr_single_smooth = _ire_mod.update_pin_hv_route_incr_single_smooth
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -524,6 +539,11 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
         polish_hard_cong_weight: float = 0.008,
         polish_cong_refresh: int = 20,
         polish_checkpoint_every: int = 50,
+        # ── Incremental real-eval keystone ──
+        # Exact top-K density/congestion trackers for channel stages. Keeps
+        # the old rebuild path available for A/B via ire_enable=False.
+        ire_enable: bool = True,
+        ire_debug_validate: bool = False,
     ):
         super().__init__(
             seed=seed,
@@ -563,6 +583,8 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
         self.polish_hard_cong_weight = polish_hard_cong_weight
         self.polish_cong_refresh = polish_cong_refresh
         self.polish_checkpoint_every = polish_checkpoint_every
+        self.ire_enable = ire_enable
+        self.ire_debug_validate = ire_debug_validate
         self.init_strategy = init_strategy
         self.init_perturb_sigma = init_perturb_sigma
         self._das_benchmark_ref: Benchmark | None = None
@@ -799,10 +821,112 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
         )
         net_hpwl = _hpwl_batch(np.arange(ni_np.shape[0], dtype=np.int32), ni_np, nm_np, pos)
         total_wl = float((net_hpwl * nw_np).sum()) / (num_nets * canvas_norm)
-        current_den = _density_cost_top5(density_grid)
-        current_cong = _hv_congestion_cost_top5(
-            h_route_grid, v_route_grid, h_macro_grid, v_macro_grid, smooth_range
+        use_ire = bool(self.ire_enable)
+        # Density top-10 is already cheap in numba. The incremental win is
+        # maintaining smoothed routing incrementally and avoiding a smoothing
+        # rebuild on every candidate.
+        density_tracker = None
+        cong_tracker = (
+            SmoothHVCostTracker(h_route_grid, v_route_grid, h_macro_grid, v_macro_grid, smooth_range)
+            if use_ire
+            else None
         )
+
+        def read_density_cost() -> float:
+            return density_tracker.cost() if density_tracker is not None else _density_cost_top5(density_grid)
+
+        def read_congestion_cost() -> float:
+            return (
+                cong_tracker.cost()
+                if cong_tracker is not None
+                else _hv_congestion_cost_top5(
+                    h_route_grid, v_route_grid, h_macro_grid, v_macro_grid, smooth_range
+                )
+            )
+
+        def sync_density_tracker(old_density_grid: np.ndarray) -> None:
+            if density_tracker is not None:
+                update_density_tracker_from_diff(density_tracker, old_density_grid, density_grid)
+
+        def sync_route_tracker(old_h_route_grid: np.ndarray, old_v_route_grid: np.ndarray) -> None:
+            if cong_tracker is not None:
+                cong_tracker.apply_route_grid_diff(old_h_route_grid, old_v_route_grid)
+
+        def sync_macro_tracker(old_h_macro_grid: np.ndarray, old_v_macro_grid: np.ndarray) -> None:
+            if cong_tracker is not None:
+                cong_tracker.apply_macro_grid_diff(old_h_macro_grid, old_v_macro_grid)
+
+        def validate_incremental_costs(label: str) -> None:
+            if not self.ire_debug_validate or not use_ire:
+                return
+            den_ref = _density_cost_top5(density_grid)
+            cong_ref = _hv_congestion_cost_top5(
+                h_route_grid, v_route_grid, h_macro_grid, v_macro_grid, smooth_range
+            )
+            den_err = abs(read_density_cost() - den_ref)
+            cong_err = abs(read_congestion_cost() - cong_ref)
+            if den_err > 1e-5 or cong_err > 2e-5:
+                raise RuntimeError(
+                    f"Incremental evaluator drift at {label}: "
+                    f"den_err={den_err:.3e} cong_err={cong_err:.3e}"
+                )
+
+        def apply_density_move(macro_idx: int, from_x: float, from_y: float, to_x: float, to_y: float) -> None:
+            if density_tracker is not None:
+                update_density_incr_tracked(
+                    density_grid, density_tracker, from_x, from_y, to_x, to_y,
+                    hw_np[macro_idx], hh_np[macro_idx],
+                    bl, br, bb, bt, bin_area, n_rows, n_cols, bin_w, bin_h,
+                )
+            else:
+                _update_density_incr(
+                    density_grid, from_x, from_y, to_x, to_y,
+                    hw_np[macro_idx], hh_np[macro_idx],
+                    bl, br, bb, bt, bin_area, n_rows, n_cols, bin_w, bin_h,
+                )
+
+        def apply_macro_route_move(macro_idx: int, from_x: float, from_y: float, to_x: float, to_y: float) -> None:
+            _update_macro_route_incr_single(
+                h_macro_grid, v_macro_grid, from_x, from_y, to_x, to_y,
+                hw_np[macro_idx], hh_np[macro_idx],
+                bl, br, bb, bt, n_rows, n_cols, bin_w, bin_h,
+                hcap, vcap, h_alloc, v_alloc,
+            )
+
+        def apply_route_move(macro_idx: int, aff: np.ndarray, from_x: float, from_y: float) -> None:
+            if _use_pin_routing:
+                pin_aff = macro_to_pin_nets[macro_idx]
+                if len(pin_aff) > 0:
+                    if cong_tracker is not None:
+                        update_pin_hv_route_incr_single_smooth(
+                            h_route_grid, v_route_grid, cong_tracker,
+                            pin_owner_p, pin_mask_p, pin_xoff_p, pin_yoff_p, pin_fx_p, pin_fy_p, nw_p,
+                            pos, pin_aff, macro_idx, from_x, from_y,
+                            bin_w, bin_h, n_rows, n_cols, hcap, vcap,
+                        )
+                    else:
+                        _update_pin_hv_route_incr_single(
+                            h_route_grid, v_route_grid,
+                            pin_owner_p, pin_mask_p, pin_xoff_p, pin_yoff_p, pin_fx_p, pin_fy_p, nw_p,
+                            pos, pin_aff, macro_idx, from_x, from_y,
+                            bin_w, bin_h, n_rows, n_cols, hcap, vcap,
+                        )
+            elif len(aff):
+                if cong_tracker is not None:
+                    update_hv_route_incr_single_smooth(
+                        h_route_grid, v_route_grid, cong_tracker, ni_np, nm_np, nw_np, pos, aff,
+                        macro_idx, from_x, from_y,
+                        bin_w, bin_h, n_rows, n_cols, hcap, vcap,
+                    )
+                else:
+                    _update_hv_route_incr_single(
+                        h_route_grid, v_route_grid, ni_np, nm_np, nw_np, pos, aff,
+                        macro_idx, from_x, from_y,
+                        bin_w, bin_h, n_rows, n_cols, hcap, vcap,
+                    )
+
+        current_den = read_density_cost()
+        current_cong = read_congestion_cost()
 
         # Calibrate fast surrogate against real proxy (recalibrated on every
         # successful checkpoint to track drift).
@@ -915,6 +1039,7 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
 
         def rebuild_fast_state(from_tensor: torch.Tensor) -> None:
             nonlocal pos, net_hpwl, total_wl, current_den, current_cong, current_proxy
+            nonlocal density_tracker, cong_tracker
             pos = from_tensor.detach().numpy().copy()
             density_grid[:] = 0
             h_route_grid[:] = 0
@@ -942,10 +1067,13 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
             )
             net_hpwl = _hpwl_batch(np.arange(ni_np.shape[0], dtype=np.int32), ni_np, nm_np, pos)
             total_wl = float((net_hpwl * nw_np).sum()) / (num_nets * canvas_norm)
-            current_den = _density_cost_top5(density_grid)
-            current_cong = _hv_congestion_cost_top5(
-                h_route_grid, v_route_grid, h_macro_grid, v_macro_grid, smooth_range
-            )
+            if use_ire:
+                density_tracker = None
+                cong_tracker = SmoothHVCostTracker(
+                    h_route_grid, v_route_grid, h_macro_grid, v_macro_grid, smooth_range
+                )
+            current_den = read_density_cost()
+            current_cong = read_congestion_cost()
             current_proxy = (
                 total_wl * wl_scale
                 + 0.5 * current_den * den_scale
@@ -1076,32 +1204,9 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
                     # ── Apply move incrementally ──
                     pos[macro_idx, 0] = x
                     pos[macro_idx, 1] = y
-                    _update_density_incr(
-                        density_grid, old_x, old_y, x, y,
-                        hw_np[macro_idx], hh_np[macro_idx],
-                        bl, br, bb, bt, bin_area, n_rows, n_cols, bin_w, bin_h,
-                    )
-                    _update_macro_route_incr_single(
-                        h_macro_grid, v_macro_grid, old_x, old_y, x, y,
-                        hw_np[macro_idx], hh_np[macro_idx],
-                        bl, br, bb, bt, n_rows, n_cols, bin_w, bin_h,
-                        hcap, vcap, h_alloc, v_alloc,
-                    )
-                    if _use_pin_routing:
-                        pin_aff = macro_to_pin_nets[macro_idx]
-                        if len(pin_aff) > 0:
-                            _update_pin_hv_route_incr_single(
-                                h_route_grid, v_route_grid,
-                                pin_owner_p, pin_mask_p, pin_xoff_p, pin_yoff_p, pin_fx_p, pin_fy_p, nw_p,
-                                pos, pin_aff, macro_idx, old_x, old_y,
-                                bin_w, bin_h, n_rows, n_cols, hcap, vcap,
-                            )
-                    elif len(aff):
-                        _update_hv_route_incr_single(
-                            h_route_grid, v_route_grid, ni_np, nm_np, nw_np, pos, aff,
-                            macro_idx, old_x, old_y,
-                            bin_w, bin_h, n_rows, n_cols, hcap, vcap,
-                        )
+                    apply_density_move(macro_idx, old_x, old_y, x, y)
+                    apply_macro_route_move(macro_idx, old_x, old_y, x, y)
+                    apply_route_move(macro_idx, aff, old_x, old_y)
                     if len(aff):
                         new_hpwl = _hpwl_batch(aff, ni_np, nm_np, pos)
                         wl_delta = float(((new_hpwl - old_hpwl) * nw_np[aff]).sum()) / (
@@ -1110,10 +1215,9 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
                     else:
                         new_hpwl = old_hpwl
                         wl_delta = 0.0
-                    new_den = _density_cost_top5(density_grid)
-                    new_cong = _hv_congestion_cost_top5(
-                        h_route_grid, v_route_grid, h_macro_grid, v_macro_grid, smooth_range
-                    )
+                    new_den = read_density_cost()
+                    new_cong = read_congestion_cost()
+                    validate_incremental_costs("hard-trial-apply")
                     proxy = (
                         (total_wl + wl_delta) * wl_scale
                         + 0.5 * new_den * den_scale
@@ -1124,32 +1228,10 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
                     # ── Always revert; only commit local_best below ──
                     pos[macro_idx, 0] = old_x
                     pos[macro_idx, 1] = old_y
-                    _update_density_incr(
-                        density_grid, x, y, old_x, old_y,
-                        hw_np[macro_idx], hh_np[macro_idx],
-                        bl, br, bb, bt, bin_area, n_rows, n_cols, bin_w, bin_h,
-                    )
-                    _update_macro_route_incr_single(
-                        h_macro_grid, v_macro_grid, x, y, old_x, old_y,
-                        hw_np[macro_idx], hh_np[macro_idx],
-                        bl, br, bb, bt, n_rows, n_cols, bin_w, bin_h,
-                        hcap, vcap, h_alloc, v_alloc,
-                    )
-                    if _use_pin_routing:
-                        pin_aff = macro_to_pin_nets[macro_idx]
-                        if len(pin_aff) > 0:
-                            _update_pin_hv_route_incr_single(
-                                h_route_grid, v_route_grid,
-                                pin_owner_p, pin_mask_p, pin_xoff_p, pin_yoff_p, pin_fx_p, pin_fy_p, nw_p,
-                                pos, pin_aff, macro_idx, x, y,
-                                bin_w, bin_h, n_rows, n_cols, hcap, vcap,
-                            )
-                    elif len(aff):
-                        _update_hv_route_incr_single(
-                            h_route_grid, v_route_grid, ni_np, nm_np, nw_np, pos, aff,
-                            macro_idx, x, y,
-                            bin_w, bin_h, n_rows, n_cols, hcap, vcap,
-                        )
+                    apply_density_move(macro_idx, x, y, old_x, old_y)
+                    apply_macro_route_move(macro_idx, x, y, old_x, old_y)
+                    apply_route_move(macro_idx, aff, x, y)
+                    validate_incremental_costs("hard-trial-revert")
 
                     pressure_bonus = min(0.003, max(0.0, pressure_drop) * (0.00035 * stale_level))
                     selection_score = proxy - pressure_bonus
@@ -1167,32 +1249,10 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
                     pos[macro_idx, 1] = y
                     cur[macro_idx, 0] = x
                     cur[macro_idx, 1] = y
-                    _update_density_incr(
-                        density_grid, old_x, old_y, x, y,
-                        hw_np[macro_idx], hh_np[macro_idx],
-                        bl, br, bb, bt, bin_area, n_rows, n_cols, bin_w, bin_h,
-                    )
-                    _update_macro_route_incr_single(
-                        h_macro_grid, v_macro_grid, old_x, old_y, x, y,
-                        hw_np[macro_idx], hh_np[macro_idx],
-                        bl, br, bb, bt, n_rows, n_cols, bin_w, bin_h,
-                        hcap, vcap, h_alloc, v_alloc,
-                    )
-                    if _use_pin_routing:
-                        pin_aff = macro_to_pin_nets[macro_idx]
-                        if len(pin_aff) > 0:
-                            _update_pin_hv_route_incr_single(
-                                h_route_grid, v_route_grid,
-                                pin_owner_p, pin_mask_p, pin_xoff_p, pin_yoff_p, pin_fx_p, pin_fy_p, nw_p,
-                                pos, pin_aff, macro_idx, old_x, old_y,
-                                bin_w, bin_h, n_rows, n_cols, hcap, vcap,
-                            )
-                    elif len(aff):
-                        _update_hv_route_incr_single(
-                            h_route_grid, v_route_grid, ni_np, nm_np, nw_np, pos, aff,
-                            macro_idx, old_x, old_y,
-                            bin_w, bin_h, n_rows, n_cols, hcap, vcap,
-                        )
+                    apply_density_move(macro_idx, old_x, old_y, x, y)
+                    apply_macro_route_move(macro_idx, old_x, old_y, x, y)
+                    apply_route_move(macro_idx, aff, old_x, old_y)
+                    validate_incremental_costs("hard-commit")
                     if len(aff):
                         net_hpwl[aff] = new_hpwl
                     total_wl += wl_delta
@@ -1410,10 +1470,97 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
         )
         net_hpwl = _hpwl_batch(np.arange(ni_np.shape[0], dtype=np.int32), ni_np, nm_np, pos)
         total_wl = float((net_hpwl * nw_np).sum()) / (num_nets * canvas_norm)
-        current_den = _density_cost_top5(density_grid)
-        current_cong = _hv_congestion_cost_top5(
-            h_route_grid, v_route_grid, h_macro_grid, v_macro_grid, smooth_range
+        use_ire = bool(self.ire_enable)
+        density_tracker = None
+        cong_tracker = (
+            SmoothHVCostTracker(h_route_grid, v_route_grid, h_macro_grid, v_macro_grid, smooth_range)
+            if use_ire
+            else None
         )
+
+        def read_density_cost() -> float:
+            return density_tracker.cost() if density_tracker is not None else _density_cost_top5(density_grid)
+
+        def read_congestion_cost() -> float:
+            return (
+                cong_tracker.cost()
+                if cong_tracker is not None
+                else _hv_congestion_cost_top5(
+                    h_route_grid, v_route_grid, h_macro_grid, v_macro_grid, smooth_range
+                )
+            )
+
+        def sync_density_tracker(old_density_grid: np.ndarray) -> None:
+            if density_tracker is not None:
+                update_density_tracker_from_diff(density_tracker, old_density_grid, density_grid)
+
+        def sync_route_tracker(old_h_route_grid: np.ndarray, old_v_route_grid: np.ndarray) -> None:
+            if cong_tracker is not None:
+                cong_tracker.apply_route_grid_diff(old_h_route_grid, old_v_route_grid)
+
+        def validate_incremental_costs(label: str) -> None:
+            if not self.ire_debug_validate or not use_ire:
+                return
+            den_ref = _density_cost_top5(density_grid)
+            cong_ref = _hv_congestion_cost_top5(
+                h_route_grid, v_route_grid, h_macro_grid, v_macro_grid, smooth_range
+            )
+            den_err = abs(read_density_cost() - den_ref)
+            cong_err = abs(read_congestion_cost() - cong_ref)
+            if den_err > 1e-5 or cong_err > 2e-5:
+                raise RuntimeError(
+                    f"Incremental evaluator drift at {label}: "
+                    f"den_err={den_err:.3e} cong_err={cong_err:.3e}"
+                )
+
+        def apply_density_move(macro_idx: int, from_x: float, from_y: float, to_x: float, to_y: float) -> None:
+            if density_tracker is not None:
+                update_density_incr_tracked(
+                    density_grid, density_tracker, from_x, from_y, to_x, to_y,
+                    hw_np[macro_idx], hh_np[macro_idx],
+                    bl, br, bb, bt, bin_area, n_rows, n_cols, bin_w, bin_h,
+                )
+            else:
+                _update_density_incr(
+                    density_grid, from_x, from_y, to_x, to_y,
+                    hw_np[macro_idx], hh_np[macro_idx],
+                    bl, br, bb, bt, bin_area, n_rows, n_cols, bin_w, bin_h,
+                )
+
+        def apply_route_move(macro_idx: int, aff: np.ndarray, from_x: float, from_y: float) -> None:
+            if _use_pin_routing:
+                pin_aff = macro_to_pin_nets[macro_idx]
+                if len(pin_aff) > 0:
+                    if cong_tracker is not None:
+                        update_pin_hv_route_incr_single_smooth(
+                            h_route_grid, v_route_grid, cong_tracker,
+                            pin_owner_p, pin_mask_p, pin_xoff_p, pin_yoff_p, pin_fx_p, pin_fy_p, nw_p,
+                            pos, pin_aff, macro_idx, from_x, from_y,
+                            bin_w, bin_h, n_rows, n_cols, hcap, vcap,
+                        )
+                    else:
+                        _update_pin_hv_route_incr_single(
+                            h_route_grid, v_route_grid,
+                            pin_owner_p, pin_mask_p, pin_xoff_p, pin_yoff_p, pin_fx_p, pin_fy_p, nw_p,
+                            pos, pin_aff, macro_idx, from_x, from_y,
+                            bin_w, bin_h, n_rows, n_cols, hcap, vcap,
+                        )
+            elif len(aff):
+                if cong_tracker is not None:
+                    update_hv_route_incr_single_smooth(
+                        h_route_grid, v_route_grid, cong_tracker, ni_np, nm_np, nw_np, pos, aff,
+                        macro_idx, from_x, from_y,
+                        bin_w, bin_h, n_rows, n_cols, hcap, vcap,
+                    )
+                else:
+                    _update_hv_route_incr_single(
+                        h_route_grid, v_route_grid, ni_np, nm_np, nw_np, pos, aff,
+                        macro_idx, from_x, from_y,
+                        bin_w, bin_h, n_rows, n_cols, hcap, vcap,
+                    )
+
+        current_den = read_density_cost()
+        current_cong = read_congestion_cost()
         wl_scale = best_metrics["wirelength_cost"] / (total_wl + 1e-8)
         den_scale = best_metrics["density_cost"] / (current_den + 1e-8)
         cong_scale = best_metrics["congestion_cost"] / (current_cong + 1e-8)
@@ -1462,6 +1609,7 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
 
         def rebuild_fast_state(from_tensor: torch.Tensor) -> None:
             nonlocal pos, net_hpwl, total_wl, current_den, current_cong, current_proxy
+            nonlocal density_tracker, cong_tracker
             pos = from_tensor.detach().numpy().copy()
             density_grid[:] = 0
             h_route_grid[:] = 0
@@ -1484,10 +1632,13 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
                 )
             net_hpwl = _hpwl_batch(np.arange(ni_np.shape[0], dtype=np.int32), ni_np, nm_np, pos)
             total_wl = float((net_hpwl * nw_np).sum()) / (num_nets * canvas_norm)
-            current_den = _density_cost_top5(density_grid)
-            current_cong = _hv_congestion_cost_top5(
-                h_route_grid, v_route_grid, h_macro_grid, v_macro_grid, smooth_range
-            )
+            if use_ire:
+                density_tracker = None
+                cong_tracker = SmoothHVCostTracker(
+                    h_route_grid, v_route_grid, h_macro_grid, v_macro_grid, smooth_range
+                )
+            current_den = read_density_cost()
+            current_cong = read_congestion_cost()
             current_proxy = (
                 total_wl * wl_scale
                 + 0.5 * current_den * den_scale
@@ -1654,26 +1805,8 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
                     # Apply move incrementally (density + HV routing only).
                     pos[macro_idx, 0] = x
                     pos[macro_idx, 1] = y
-                    _update_density_incr(
-                        density_grid, old_x, old_y, x, y,
-                        hw_np[macro_idx], hh_np[macro_idx],
-                        bl, br, bb, bt, bin_area, n_rows, n_cols, bin_w, bin_h,
-                    )
-                    if _use_pin_routing:
-                        pin_aff = macro_to_pin_nets[macro_idx]
-                        if len(pin_aff) > 0:
-                            _update_pin_hv_route_incr_single(
-                                h_route_grid, v_route_grid,
-                                pin_owner_p, pin_mask_p, pin_xoff_p, pin_yoff_p, pin_fx_p, pin_fy_p, nw_p,
-                                pos, pin_aff, macro_idx, old_x, old_y,
-                                bin_w, bin_h, n_rows, n_cols, hcap, vcap,
-                            )
-                    elif len(aff):
-                        _update_hv_route_incr_single(
-                            h_route_grid, v_route_grid, ni_np, nm_np, nw_np, pos, aff,
-                            macro_idx, old_x, old_y,
-                            bin_w, bin_h, n_rows, n_cols, hcap, vcap,
-                        )
+                    apply_density_move(macro_idx, old_x, old_y, x, y)
+                    apply_route_move(macro_idx, aff, old_x, old_y)
                     if len(aff):
                         new_hpwl = _hpwl_batch(aff, ni_np, nm_np, pos)
                         wl_delta = float(((new_hpwl - old_hpwl) * nw_np[aff]).sum()) / (
@@ -1682,10 +1815,9 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
                     else:
                         new_hpwl = old_hpwl
                         wl_delta = 0.0
-                    new_den = _density_cost_top5(density_grid)
-                    new_cong = _hv_congestion_cost_top5(
-                        h_route_grid, v_route_grid, h_macro_grid, v_macro_grid, smooth_range
-                    )
+                    new_den = read_density_cost()
+                    new_cong = read_congestion_cost()
+                    validate_incremental_costs("soft-trial-apply")
                     proxy = (
                         (total_wl + wl_delta) * wl_scale
                         + 0.5 * new_den * den_scale
@@ -1696,26 +1828,9 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
                     # Always revert; only commit local_best below.
                     pos[macro_idx, 0] = old_x
                     pos[macro_idx, 1] = old_y
-                    _update_density_incr(
-                        density_grid, x, y, old_x, old_y,
-                        hw_np[macro_idx], hh_np[macro_idx],
-                        bl, br, bb, bt, bin_area, n_rows, n_cols, bin_w, bin_h,
-                    )
-                    if _use_pin_routing:
-                        pin_aff = macro_to_pin_nets[macro_idx]
-                        if len(pin_aff) > 0:
-                            _update_pin_hv_route_incr_single(
-                                h_route_grid, v_route_grid,
-                                pin_owner_p, pin_mask_p, pin_xoff_p, pin_yoff_p, pin_fx_p, pin_fy_p, nw_p,
-                                pos, pin_aff, macro_idx, x, y,
-                                bin_w, bin_h, n_rows, n_cols, hcap, vcap,
-                            )
-                    elif len(aff):
-                        _update_hv_route_incr_single(
-                            h_route_grid, v_route_grid, ni_np, nm_np, nw_np, pos, aff,
-                            macro_idx, x, y,
-                            bin_w, bin_h, n_rows, n_cols, hcap, vcap,
-                        )
+                    apply_density_move(macro_idx, x, y, old_x, old_y)
+                    apply_route_move(macro_idx, aff, x, y)
+                    validate_incremental_costs("soft-trial-revert")
 
                     pressure_bonus = min(0.003, max(0.0, pressure_drop) * (0.00035 * stale_level))
                     selection_score = proxy - pressure_bonus
@@ -1732,26 +1847,9 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
                     pos[macro_idx, 1] = y
                     cur[macro_idx, 0] = x
                     cur[macro_idx, 1] = y
-                    _update_density_incr(
-                        density_grid, old_x, old_y, x, y,
-                        hw_np[macro_idx], hh_np[macro_idx],
-                        bl, br, bb, bt, bin_area, n_rows, n_cols, bin_w, bin_h,
-                    )
-                    if _use_pin_routing:
-                        pin_aff = macro_to_pin_nets[macro_idx]
-                        if len(pin_aff) > 0:
-                            _update_pin_hv_route_incr_single(
-                                h_route_grid, v_route_grid,
-                                pin_owner_p, pin_mask_p, pin_xoff_p, pin_yoff_p, pin_fx_p, pin_fy_p, nw_p,
-                                pos, pin_aff, macro_idx, old_x, old_y,
-                                bin_w, bin_h, n_rows, n_cols, hcap, vcap,
-                            )
-                    elif len(aff):
-                        _update_hv_route_incr_single(
-                            h_route_grid, v_route_grid, ni_np, nm_np, nw_np, pos, aff,
-                            macro_idx, old_x, old_y,
-                            bin_w, bin_h, n_rows, n_cols, hcap, vcap,
-                        )
+                    apply_density_move(macro_idx, old_x, old_y, x, y)
+                    apply_route_move(macro_idx, aff, old_x, old_y)
+                    validate_incremental_costs("soft-commit")
                     if len(aff):
                         net_hpwl[aff] = new_hpwl
                     total_wl += wl_delta

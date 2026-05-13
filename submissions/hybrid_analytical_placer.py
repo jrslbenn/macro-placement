@@ -13,6 +13,8 @@ import pstats
 import io
 import random
 import builtins
+import importlib.util
+import os
 from pathlib import Path
 from time import perf_counter as time
 from typing import List, Optional, Tuple
@@ -25,6 +27,14 @@ from scipy.fft import dctn, idctn
 from macro_place.benchmark import Benchmark
 from macro_place.loader import load_benchmark, load_benchmark_from_dir
 from macro_place.objective import _set_placement, compute_proxy_cost
+
+_IRE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "incremental_real_eval.py")
+_ire_spec = importlib.util.spec_from_file_location("_hap_incremental_real_eval_parent", _IRE_PATH)
+_ire_mod = importlib.util.module_from_spec(_ire_spec)
+_ire_spec.loader.exec_module(_ire_mod)
+SmoothHVCostTracker = _ire_mod.SmoothHVCostTracker
+update_hv_route_incr_single_smooth = _ire_mod.update_hv_route_incr_single_smooth
+update_pin_hv_route_incr_single_smooth = _ire_mod.update_pin_hv_route_incr_single_smooth
 
 
 class ProgressGate:
@@ -1813,11 +1823,12 @@ class HybridAnalyticalPlacer:
                 h_macro_grid, v_macro_grid, sa_pos, sizes_np, num_hard, bl, br, bb, bt,
                 n_rows, n_cols, bin_w, bin_h, hcap, vcap, h_alloc, v_alloc,
             )
-
-            current_den = _density_cost_top5(density_grid)
-            current_cong = _hv_congestion_cost_top5(
+            cong_tracker = SmoothHVCostTracker(
                 h_route_grid, v_route_grid, h_macro_grid, v_macro_grid, smooth_range
             )
+
+            current_den = _density_cost_top5(density_grid)
+            current_cong = cong_tracker.cost()
 
             # Calibrate fast proxy to match real proxy scale
             _set_placement(plc, sa_placement.detach(), benchmark)
@@ -1858,7 +1869,10 @@ class HybridAnalyticalPlacer:
                         _build_hv_route_grid(h_route_grid, v_route_grid, ni_np, nm_np, nw_np, sa_pos, num_nets, bin_w, bin_h, n_rows, n_cols, hcap, vcap)
                     _build_macro_route_grid(h_macro_grid, v_macro_grid, sa_pos, sizes_np, num_hard, bl, br, bb, bt, n_rows, n_cols, bin_w, bin_h, hcap, vcap, h_alloc, v_alloc)
                     current_den = _density_cost_top5(density_grid)
-                    current_cong = _hv_congestion_cost_top5(h_route_grid, v_route_grid, h_macro_grid, v_macro_grid, smooth_range)
+                    cong_tracker = SmoothHVCostTracker(
+                        h_route_grid, v_route_grid, h_macro_grid, v_macro_grid, smooth_range
+                    )
+                    current_cong = cong_tracker.cost()
                     current_proxy = total_wl + 0.5 * (current_den * den_scale) + .5 * (current_cong * cong_scale)
 
                 if total % 100000 == 0 and total > 0:
@@ -1913,16 +1927,16 @@ class HybridAnalyticalPlacer:
                 if _use_pin_routing:
                     pin_aff = macro_to_pin_nets[i]
                     if len(pin_aff) > 0:
-                        _update_pin_hv_route_incr_single(
-                            h_route_grid, v_route_grid,
+                        update_pin_hv_route_incr_single_smooth(
+                            h_route_grid, v_route_grid, cong_tracker,
                             pin_owner_p, pin_mask_p, pin_xoff_p, pin_yoff_p, pin_fx_p, pin_fy_p, nw_p,
                             sa_pos, pin_aff, i, old_x, old_y,
                             bin_w, bin_h, n_rows, n_cols, hcap, vcap,
                         )
                 else:
-                    _update_hv_route_incr_single(h_route_grid, v_route_grid, ni_np, nm_np, nw_np, sa_pos, aff, i, old_x, old_y, bin_w, bin_h, n_rows, n_cols, hcap, vcap)
+                    update_hv_route_incr_single_smooth(h_route_grid, v_route_grid, cong_tracker, ni_np, nm_np, nw_np, sa_pos, aff, i, old_x, old_y, bin_w, bin_h, n_rows, n_cols, hcap, vcap)
                 _update_macro_route_incr_single(h_macro_grid, v_macro_grid, old_x, old_y, new_x, new_y, hw_np[i], hh_np[i], bl, br, bb, bt, n_rows, n_cols, bin_w, bin_h, hcap, vcap, h_alloc, v_alloc)
-                new_cong = _hv_congestion_cost_top5(h_route_grid, v_route_grid, h_macro_grid, v_macro_grid, smooth_range)
+                new_cong = cong_tracker.cost()
 
                 new_proxy = (total_wl + wl_delta) + 0.5 * (new_den * den_scale) + .5 * (new_cong * cong_scale)
 
@@ -1975,7 +1989,10 @@ class HybridAnalyticalPlacer:
                                 _build_hv_route_grid(h_route_grid, v_route_grid, ni_np, nm_np, nw_np, sa_pos, num_nets, bin_w, bin_h, n_rows, n_cols, hcap, vcap)
                             _build_macro_route_grid(h_macro_grid, v_macro_grid, sa_pos, sizes_np, num_hard, bl, br, bb, bt, n_rows, n_cols, bin_w, bin_h, hcap, vcap, h_alloc, v_alloc)
                             current_den = _density_cost_top5(density_grid)
-                            current_cong = _hv_congestion_cost_top5(h_route_grid, v_route_grid, h_macro_grid, v_macro_grid, smooth_range)
+                            cong_tracker = SmoothHVCostTracker(
+                                h_route_grid, v_route_grid, h_macro_grid, v_macro_grid, smooth_range
+                            )
+                            current_cong = cong_tracker.cost()
                             # After revert, components are now for best state.
                             # Refit scales to best so fast proxy is honest here too.
                             _set_placement(plc, sa_placement.detach(), benchmark)
@@ -1999,14 +2016,14 @@ class HybridAnalyticalPlacer:
                     if _use_pin_routing:
                         pin_aff = macro_to_pin_nets[i]
                         if len(pin_aff) > 0:
-                            _update_pin_hv_route_incr_single(
-                                h_route_grid, v_route_grid,
+                            update_pin_hv_route_incr_single_smooth(
+                                h_route_grid, v_route_grid, cong_tracker,
                                 pin_owner_p, pin_mask_p, pin_xoff_p, pin_yoff_p, pin_fx_p, pin_fy_p, nw_p,
                                 sa_pos, pin_aff, i, new_x, new_y,
                                 bin_w, bin_h, n_rows, n_cols, hcap, vcap,
                             )
                     else:
-                        _update_hv_route_incr_single(h_route_grid, v_route_grid, ni_np, nm_np, nw_np, sa_pos, aff, i, new_x, new_y, bin_w, bin_h, n_rows, n_cols, hcap, vcap)
+                        update_hv_route_incr_single_smooth(h_route_grid, v_route_grid, cong_tracker, ni_np, nm_np, nw_np, sa_pos, aff, i, new_x, new_y, bin_w, bin_h, n_rows, n_cols, hcap, vcap)
                     _update_macro_route_incr_single(h_macro_grid, v_macro_grid, new_x, new_y, old_x, old_y, hw_np[i], hh_np[i], bl, br, bb, bt, n_rows, n_cols, bin_w, bin_h, hcap, vcap, h_alloc, v_alloc)
 
                 if total - last_accept_step > 5_000_000:

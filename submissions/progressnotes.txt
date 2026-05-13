@@ -1,0 +1,37 @@
+1. Nesterov goes wrong direction, reverts to initial. Open.
+Q: Can we get better starts than the IBM initial placement? A: Yes — spectral init (Fiedler vector, free/deterministic), DAS-weighted random + brief Nesterov, or N parallel-seeded runs. Pick best survivor of parent's pipeline. This is the "multiple worlds" idea, and the natural fit for the 16-core hardware.
+
+2. SA swap no improvement. Open.
+Q: Is hard-macro swap fundamentally limited on cong-bound benches? A: Yes, on these benches WL-only acceptance can't find moves that materially shift dominant cost. Same fix as #3 applies — cong-aware accept criterion — but lower ROI here since num_hard is small.
+
+3. SA soft swap no improvement, but real proxy oscillates 0.05. Open.
+Q: Add cong-aware accept criterion (the "cheap" option from earlier)? A: Yes, this was my recommended #1 next-step before you redirected to HV. Now that HV is being moved to parent, SA soft swap can use the structurally-correct HV grid directly — bigger payoff than RUDY would've been.
+
+4. Soft spread stalls in 3s, 50 tried. Done.
+Q: Just bump the stall threshold? A: Done with widening on each stall (stale_level ramp): radius 1×→4×, uphill tolerance 1×→3.5×, threshold 3→8. Each retry now meaningfully different.
+
+5. SA soft displace oscillates, needs more leeway. Open.
+Q: Same checkpoint+revert pattern as SA displace? A: Yes — same fix as #6 should apply: recalibrate scales every checkpoint, swap RUDY→HV. Currently has neither.
+
+6. SA displace fast oscillates, real reverts to 400 accept. Partially done (in progress).
+Q: Recalibrate fast proxy at every checkpoint? A: Done. Q: Swap RUDY→HV in SA displace? A: In progress — HV helpers moved to parent (just now), still need to update SA displace's init/per-move/revert code.
+
+7. Channel relocate big jump then stalls. Genuine stuck or fixable? Partially done.
+Q: Stalls because hard-macro positions are at local optimum given fixed soft layout. A: Partial fix — structural region centers added so it can do longer-range moves. Deeper fix: iterate channel↔soft_channel (run channel, then soft_channel, then channel again) so each unsticks the other.
+
+8. Soft channel relocate fast=1.398 vs real=1.518 (gap 0.12). Open.
+Q: Recalibrate every checkpoint here too? A: Yes, same fix as #6. The HV swap also helps because soft macros' RUDY contribution was the worst-calibrated of all stages.
+
+9. Polish exploded. Done.
+Q: Why did polish blow up? A: Cong gradient (RUDY finite diff) had unnormalized magnitude. Fixed by normalizing to [-1,1] range. ibm01 polish now drops 1.0327 → 0.9762.
+
+Meta-A. Fast proxy accuracy. Partial.
+Q: Per-checkpoint recalibration? A: Done in SA displace. Still missing in SA, SA soft swap, SA soft displace, soft spread. Q: Linear/OLS model? A: Worth it AFTER the HV swap (currently the structural mismatch dominates).
+
+Meta-B. Escape stuck spots. Partial.
+Q: Iterate channel↔soft_channel? A: Open. Q: Pair-move proposals (move 2 macros together)? A: Open. Q: Larger SA temperature on stalls? A: Open. Q: Multi-seed branching (the "parallel worlds")? A: Open — also fits #1.
+
+Meta-C. Better starts than IBM initial. Open.
+Q: This is the highest-leverage unaddressed lever. A: Concrete options: spectral init, force-directed init, DAS-weighted random+Nesterov, N parallel-init branches. The 16-core hardware makes multi-init essentially free.
+
+Where we are right now: HV helpers are at parent module level. Need ~30 lines of edits to SA displace to actually use them, then verify imports + smoke test. Want me to finish that thread before tackling anything else, or pivot?
