@@ -1104,6 +1104,20 @@ class HybridAnalyticalPlacer:
         inflation_decay: float = 0.040,
         inflation_hard_cap: float = 1.28,
         inflation_soft_cap: float = 1.55,
+        # Kept as an opt-in experiment. In the incremental-real-eval sweep,
+        # soft spread never improved the retained checkpoint, so default
+        # runtime is better spent on soft displace / SA displace.
+        enable_soft_spread: bool = False,
+        # Multi-macro soft local-neighborhood search. This is the coordinated
+        # version of the soft-displace breakthrough: try permutations and
+        # larger repacks inside congested soft neighborhoods, but only keep
+        # real-proxy-improving checkpoints.
+        enable_soft_lns: bool = False,
+        # Soft macro coordinate descent / line search. This is the cautious
+        # follow-up to soft displace: one soft macro at a time, many targeted
+        # candidate positions, same incremental real-ish proxy and real-proxy
+        # checkpoint guard.
+        enable_soft_cd: bool = True,
     ):
         self.seed = seed
         self.num_steps = num_steps
@@ -1123,6 +1137,9 @@ class HybridAnalyticalPlacer:
         self.inflation_decay = inflation_decay
         self.inflation_hard_cap = inflation_hard_cap
         self.inflation_soft_cap = inflation_soft_cap
+        self.enable_soft_spread = enable_soft_spread
+        self.enable_soft_lns = enable_soft_lns
+        self.enable_soft_cd = enable_soft_cd
 
     def place(self, benchmark: Benchmark) -> torch.Tensor:
         log_dir = Path("logs")
@@ -1256,9 +1273,9 @@ class HybridAnalyticalPlacer:
 
         start_time = time()
         total_time_budget = 1800
-        hard_time_budget = 2400
+        hard_time_budget = 2100
         min_stage_budget = 120
-        nesterov_time_budget = 240
+        nesterov_time_budget = 360
         step = 0
         track_proxies = []
         print("starting iters")
@@ -1551,7 +1568,7 @@ class HybridAnalyticalPlacer:
 
         if best_valid_placement is not None and plc is not None:
             remaining = total_time_budget - (time() - start_time)
-            swap_budget = stage_budget("SA swap", max_budget=240)
+            swap_budget = stage_budget("SA swap", max_budget=90)
             print(
                 f"SA swap budget: {swap_budget:.0f}s "
                 f"(elapsed={time()-start_time:.1f}s remaining={remaining:.1f}s)"
@@ -1579,7 +1596,7 @@ class HybridAnalyticalPlacer:
 
             if benchmark.num_soft_macros > 1:
                 remaining = total_time_budget - (time() - start_time)
-                soft_swap_budget = stage_budget("SA soft swap", max_budget=180)
+                soft_swap_budget = stage_budget("SA soft swap", max_budget=90)
                 print(
                     f"SA soft swap budget: {soft_swap_budget:.0f}s "
                     f"(elapsed={time()-start_time:.1f}s remaining={remaining:.1f}s)"
@@ -1602,33 +1619,36 @@ class HybridAnalyticalPlacer:
                 else:
                     print("SA soft swap skipped: no remaining budget")
 
-                remaining = total_time_budget - (time() - start_time)
-                soft_spread_budget = stage_budget("Soft spread", max_budget=180)
-                print(
-                    f"Soft spread budget: {soft_spread_budget:.0f}s "
-                    f"(elapsed={time()-start_time:.1f}s remaining={remaining:.1f}s)"
-                )
-                if soft_spread_budget > 0:
-                    best_valid_placement = self._soft_spread_refine(
-                        best_valid_placement,
-                        benchmark,
-                        plc,
-                        net_indices,
-                        net_mask,
-                        net_weights,
-                        canvas_norm,
-                        num_hard,
-                        num_all,
-                        fixed,
-                        budget=soft_spread_budget,
-                        checkpoint_every=50,
+                if self.enable_soft_spread:
+                    remaining = total_time_budget - (time() - start_time)
+                    soft_spread_budget = stage_budget("Soft spread", max_budget=180)
+                    print(
+                        f"Soft spread budget: {soft_spread_budget:.0f}s "
+                        f"(elapsed={time()-start_time:.1f}s remaining={remaining:.1f}s)"
                     )
-                    _save_plot("04_soft_spread", best_valid_placement)
+                    if soft_spread_budget > 0:
+                        best_valid_placement = self._soft_spread_refine(
+                            best_valid_placement,
+                            benchmark,
+                            plc,
+                            net_indices,
+                            net_mask,
+                            net_weights,
+                            canvas_norm,
+                            num_hard,
+                            num_all,
+                            fixed,
+                            budget=soft_spread_budget,
+                            checkpoint_every=50,
+                        )
+                        _save_plot("04_soft_spread", best_valid_placement)
+                    else:
+                        print("Soft spread skipped: no remaining budget")
                 else:
-                    print("Soft spread skipped: no remaining budget")
+                    print("Soft spread disabled")
 
                 remaining = total_time_budget - (time() - start_time)
-                soft_displace_budget = stage_budget("SA soft displace", max_budget=180)
+                soft_displace_budget = stage_budget("SA soft displace", max_budget=600)
                 print(
                     f"SA soft displace budget: {soft_displace_budget:.0f}s "
                     f"(elapsed={time()-start_time:.1f}s remaining={remaining:.1f}s)"
@@ -1652,8 +1672,64 @@ class HybridAnalyticalPlacer:
                 else:
                     print("SA soft displace skipped: no remaining budget")
 
+                if self.enable_soft_cd:
+                    remaining = total_time_budget - (time() - start_time)
+                    soft_cd_budget = stage_budget("SA soft CD", max_budget=240)
+                    print(
+                        f"SA soft CD budget: {soft_cd_budget:.0f}s "
+                        f"(elapsed={time()-start_time:.1f}s remaining={remaining:.1f}s)"
+                    )
+                    if soft_cd_budget > 0:
+                        best_valid_placement = self._sa_soft_cd_refine(
+                            best_valid_placement,
+                            benchmark,
+                            plc,
+                            net_indices,
+                            net_mask,
+                            net_weights,
+                            canvas_norm,
+                            num_hard,
+                            num_all,
+                            fixed,
+                            budget=soft_cd_budget,
+                            checkpoint_every=60,
+                        )
+                        _save_plot("05b_soft_cd", best_valid_placement)
+                    else:
+                        print("SA soft CD skipped: no remaining budget")
+                else:
+                    print("SA soft CD disabled")
+
+                if self.enable_soft_lns:
+                    remaining = total_time_budget - (time() - start_time)
+                    soft_lns_budget = stage_budget("SA soft LNS", max_budget=180)
+                    print(
+                        f"SA soft LNS budget: {soft_lns_budget:.0f}s "
+                        f"(elapsed={time()-start_time:.1f}s remaining={remaining:.1f}s)"
+                    )
+                    if soft_lns_budget > 0:
+                        best_valid_placement = self._sa_soft_lns_repack(
+                            best_valid_placement,
+                            benchmark,
+                            plc,
+                            net_indices,
+                            net_mask,
+                            net_weights,
+                            canvas_norm,
+                            num_hard,
+                            num_all,
+                            fixed,
+                            budget=soft_lns_budget,
+                            checkpoint_every=16,
+                        )
+                        _save_plot("05c_soft_lns", best_valid_placement)
+                    else:
+                        print("SA soft LNS skipped: no remaining budget")
+                else:
+                    print("SA soft LNS disabled")
+
             remaining = total_time_budget - (time() - start_time)
-            displace_budget = stage_budget("SA displace", max_budget=240)
+            displace_budget = stage_budget("SA displace", max_budget=360)
             print(
                 f"SA displace budget: {displace_budget:.0f}s "
                 f"(elapsed={time()-start_time:.1f}s remaining={remaining:.1f}s)"
@@ -2569,6 +2645,837 @@ class HybridAnalyticalPlacer:
         print(f"Soft spread done: {total} tried, {accepts} accepts, best proxy={best_proxy:.4f}")
         return best_placement
 
+    def _sa_soft_cd_refine(
+        self,
+        placement,
+        benchmark,
+        plc,
+        net_indices,
+        net_mask,
+        net_weights,
+        canvas_norm,
+        num_hard,
+        num_all,
+        fixed,
+        budget=240,
+        checkpoint_every=60,
+    ):
+        """Soft-macro coordinate descent with incremental WL+density+HV proxy."""
+        num_soft = num_all - num_hard
+        if num_soft < 1:
+            return placement
+
+        cd_placement = placement.clone()
+        cd_pos, macro_to_nets, net_hpwl, _eval_delta, total_wl = self._build_incremental_wl(
+            net_indices, net_mask, net_weights, cd_placement, num_all, canvas_norm
+        )
+
+        soft_candidates = np.array(
+            [
+                i for i in range(num_hard, num_all)
+                if (not fixed[i].item()) and len(macro_to_nets[i]) > 0
+            ],
+            dtype=np.int32,
+        )
+        if soft_candidates.size == 0:
+            return placement
+
+        ni_np = net_indices.numpy().copy()
+        nm_np = net_mask.numpy().copy()
+        nw_np = net_weights.numpy().copy()
+        num_nets = ni_np.shape[0]
+        max_degree = ni_np.shape[1]
+        sizes_np = benchmark.macro_sizes[:num_all].numpy().copy()
+        hw_np = sizes_np[:, 0] / 2
+        hh_np = sizes_np[:, 1] / 2
+
+        bl = self._bin_left.numpy().copy()
+        br = self._bin_right.numpy().copy()
+        bb = self._bin_bottom.numpy().copy()
+        bt = self._bin_top.numpy().copy()
+        bin_w = float(self._bin_w)
+        bin_h = float(self._bin_h)
+        bin_area = bin_w * bin_h
+        n_rows = benchmark.grid_rows
+        n_cols = benchmark.grid_cols
+
+        density_grid = np.zeros((n_rows, n_cols), dtype=np.float32)
+        _build_density_grid(
+            density_grid, cd_pos, sizes_np, num_all, bl, br, bb, bt,
+            bin_area, n_rows, n_cols, bin_w, bin_h,
+        )
+
+        hcap = max(1e-6, bin_h * float(getattr(benchmark, "hroutes_per_micron", 1.0) or 1.0))
+        vcap = max(1e-6, bin_w * float(getattr(benchmark, "vroutes_per_micron", 1.0) or 1.0))
+        try:
+            smooth_range = int(plc.get_congestion_smooth_range())
+        except Exception:
+            smooth_range = int(getattr(plc, "smooth_range", 2) or 2)
+        smooth_range = max(0, smooth_range)
+        try:
+            h_alloc, v_alloc = plc.get_macro_routing_allocation()
+        except Exception:
+            h_alloc = float(getattr(plc, "hrouting_alloc", 0.0) or 0.0)
+            v_alloc = float(getattr(plc, "vrouting_alloc", 0.0) or 0.0)
+        h_alloc = float(h_alloc)
+        v_alloc = float(v_alloc)
+
+        h_route_grid = np.zeros((n_rows, n_cols), dtype=np.float32)
+        v_route_grid = np.zeros((n_rows, n_cols), dtype=np.float32)
+        h_macro_grid = np.zeros((n_rows, n_cols), dtype=np.float32)
+        v_macro_grid = np.zeros((n_rows, n_cols), dtype=np.float32)
+
+        _pin_tensors = build_pin_route_tensors(benchmark)
+        _use_pin_routing = _pin_tensors is not None
+        if _use_pin_routing:
+            pin_owner_p, pin_mask_p, pin_xoff_p, pin_yoff_p, pin_fx_p, pin_fy_p, nw_p = _pin_tensors
+            macro_to_pin_nets = build_macro_to_pin_nets(benchmark, num_all)
+            num_pin_nets = pin_owner_p.shape[0]
+            _build_pin_hv_route_grid(
+                h_route_grid, v_route_grid,
+                pin_owner_p, pin_mask_p, pin_xoff_p, pin_yoff_p, pin_fx_p, pin_fy_p, nw_p,
+                cd_pos, num_pin_nets, bin_w, bin_h, n_rows, n_cols, hcap, vcap,
+            )
+        else:
+            _build_hv_route_grid(
+                h_route_grid, v_route_grid, ni_np, nm_np, nw_np, cd_pos, num_nets,
+                bin_w, bin_h, n_rows, n_cols, hcap, vcap,
+            )
+        # Soft macros do not block routing; hard blockage is fixed in this stage.
+        _build_macro_route_grid(
+            h_macro_grid, v_macro_grid, cd_pos, sizes_np, num_hard, bl, br, bb, bt,
+            n_rows, n_cols, bin_w, bin_h, hcap, vcap, h_alloc, v_alloc,
+        )
+        cong_tracker = SmoothHVCostTracker(
+            h_route_grid, v_route_grid, h_macro_grid, v_macro_grid, smooth_range
+        )
+
+        current_den = _density_cost_top5(density_grid)
+        current_cong = cong_tracker.cost()
+        _set_placement(plc, cd_placement.detach(), benchmark)
+        real_metrics = compute_proxy_cost(cd_placement.detach(), benchmark, plc)
+        best_proxy = real_metrics["proxy_cost"]
+        den_scale = real_metrics["density_cost"] / (current_den + 1e-8)
+        cong_scale = real_metrics["congestion_cost"] / (current_cong + 1e-8)
+        current_proxy = (
+            total_wl
+            + 0.5 * current_den * den_scale
+            + 0.5 * current_cong * cong_scale
+        )
+        best_placement = cd_placement.clone()
+        print(
+            f"SA soft CD start: proxy={best_proxy:.4f} fast={current_proxy:.4f} "
+            f"wl={total_wl:.4f} candidates={soft_candidates.size} "
+            f"(HV cong, smooth={smooth_range})"
+        )
+
+        def rebuild_fast_state(from_tensor):
+            nonlocal cd_placement, cd_pos, net_hpwl, total_wl
+            nonlocal current_den, current_cong, current_proxy, cong_tracker
+            cd_placement = from_tensor.clone()
+            cd_pos[:] = cd_placement.detach().numpy()
+            net_hpwl[:] = _hpwl_batch(np.arange(num_nets, dtype=np.int32), ni_np, nm_np, cd_pos)
+            total_wl = float((net_hpwl * nw_np).sum()) / (num_nets * canvas_norm)
+            density_grid[:] = 0
+            _build_density_grid(
+                density_grid, cd_pos, sizes_np, num_all, bl, br, bb, bt,
+                bin_area, n_rows, n_cols, bin_w, bin_h,
+            )
+            h_route_grid[:] = 0
+            v_route_grid[:] = 0
+            if _use_pin_routing:
+                _build_pin_hv_route_grid(
+                    h_route_grid, v_route_grid,
+                    pin_owner_p, pin_mask_p, pin_xoff_p, pin_yoff_p, pin_fx_p, pin_fy_p, nw_p,
+                    cd_pos, num_pin_nets, bin_w, bin_h, n_rows, n_cols, hcap, vcap,
+                )
+            else:
+                _build_hv_route_grid(
+                    h_route_grid, v_route_grid, ni_np, nm_np, nw_np, cd_pos, num_nets,
+                    bin_w, bin_h, n_rows, n_cols, hcap, vcap,
+                )
+            cong_tracker = SmoothHVCostTracker(
+                h_route_grid, v_route_grid, h_macro_grid, v_macro_grid, smooth_range
+            )
+            current_den = _density_cost_top5(density_grid)
+            current_cong = cong_tracker.cost()
+            current_proxy = (
+                total_wl
+                + 0.5 * current_den * den_scale
+                + 0.5 * current_cong * cong_scale
+            )
+
+        def apply_one(i, old_x, old_y, new_x, new_y):
+            cd_pos[i, 0] = new_x
+            cd_pos[i, 1] = new_y
+            _update_density_incr(
+                density_grid, old_x, old_y, new_x, new_y,
+                hw_np[i], hh_np[i], bl, br, bb, bt, bin_area, n_rows, n_cols, bin_w, bin_h,
+            )
+            if _use_pin_routing:
+                pin_aff = macro_to_pin_nets[i]
+                if len(pin_aff) > 0:
+                    update_pin_hv_route_incr_single_smooth(
+                        h_route_grid, v_route_grid, cong_tracker,
+                        pin_owner_p, pin_mask_p, pin_xoff_p, pin_yoff_p, pin_fx_p, pin_fy_p, nw_p,
+                        cd_pos, pin_aff, i, old_x, old_y,
+                        bin_w, bin_h, n_rows, n_cols, hcap, vcap,
+                    )
+            else:
+                aff_i = macro_to_nets[i]
+                if len(aff_i) > 0:
+                    update_hv_route_incr_single_smooth(
+                        h_route_grid, v_route_grid, cong_tracker,
+                        ni_np, nm_np, nw_np, cd_pos, aff_i, i, old_x, old_y,
+                        bin_w, bin_h, n_rows, n_cols, hcap, vcap,
+                    )
+
+        def macro_barycenter(i):
+            sx = sy = sw = 0.0
+            for n in macro_to_nets[i]:
+                w = float(nw_np[n])
+                for d in range(max_degree):
+                    if not nm_np[n, d]:
+                        break
+                    j = int(ni_np[n, d])
+                    if j == i:
+                        continue
+                    sx += float(cd_pos[j, 0]) * w
+                    sy += float(cd_pos[j, 1]) * w
+                    sw += w
+            if sw <= 0.0:
+                return float(cd_pos[i, 0]), float(cd_pos[i, 1])
+            return sx / sw, sy / sw
+
+        def local_pressure_grid():
+            return density_grid + 0.5 * (cong_tracker.h_smooth + cong_tracker.v_smooth)
+
+        def soft_order():
+            rows = np.clip((cd_pos[soft_candidates, 1] / bin_h).astype(np.int64), 0, n_rows - 1)
+            cols = np.clip((cd_pos[soft_candidates, 0] / bin_w).astype(np.int64), 0, n_cols - 1)
+            pressure = local_pressure_grid()[rows, cols]
+            degree = np.array([len(macro_to_nets[int(i)]) for i in soft_candidates], dtype=np.float32)
+            score = pressure + 0.01 * np.sqrt(degree) + 0.002 * np.random.random(size=pressure.shape)
+            visit_n = min(soft_candidates.size, 320)
+            if soft_candidates.size <= visit_n:
+                order = np.arange(soft_candidates.size)
+            else:
+                order = np.argpartition(score, -visit_n)[-visit_n:]
+            order = order[np.argsort(-score[order])]
+            return soft_candidates[order]
+
+        def candidate_positions(i, step_scale):
+            x = float(cd_pos[i, 0])
+            y = float(cd_pos[i, 1])
+            out = []
+            for s in (1.0, 0.5, 0.25):
+                d = step_scale * s
+                out.extend(((x + d, y), (x - d, y), (x, y + d), (x, y - d)))
+
+            bx, by = macro_barycenter(i)
+            for frac in (0.35, 0.65, 1.0):
+                out.append((x + frac * (bx - x), y + frac * (by - y)))
+
+            pressure = local_pressure_grid()
+            r = int(np.clip(y / bin_h, 1, n_rows - 2))
+            c = int(np.clip(x / bin_w, 1, n_cols - 2))
+            gx = float(pressure[r, c + 1] - pressure[r, c - 1])
+            gy = float(pressure[r + 1, c] - pressure[r - 1, c])
+            gnorm = math.hypot(gx, gy)
+            if gnorm > 1e-8:
+                out.append((x - step_scale * gx / gnorm, y - step_scale * gy / gnorm))
+                out.append((x - 0.5 * step_scale * gx / gnorm, y - 0.5 * step_scale * gy / gnorm))
+
+            win = max(step_scale * 1.5, max(bin_w, bin_h) * 2.0)
+            c0 = max(0, int((x - win) / bin_w))
+            c1 = min(n_cols - 1, int((x + win) / bin_w))
+            r0 = max(0, int((y - win) / bin_h))
+            r1 = min(n_rows - 1, int((y + win) / bin_h))
+            sub = pressure[r0 : r1 + 1, c0 : c1 + 1]
+            if sub.size > 0:
+                low_n = min(6, sub.size)
+                low = np.argpartition(sub.reshape(-1), low_n - 1)[:low_n]
+                for flat_idx in low:
+                    rr = r0 + int(flat_idx) // sub.shape[1]
+                    cc = c0 + int(flat_idx) % sub.shape[1]
+                    out.append(((cc + 0.5) * bin_w, (rr + 0.5) * bin_h))
+
+            clipped = []
+            seen = set()
+            for cx, cy in out:
+                cx = float(np.clip(cx, hw_np[i], benchmark.canvas_width - hw_np[i]))
+                cy = float(np.clip(cy, hh_np[i], benchmark.canvas_height - hh_np[i]))
+                key = (round(cx, 4), round(cy, 4))
+                if key != (round(x, 4), round(y, 4)) and key not in seen:
+                    clipped.append((cx, cy))
+                    seen.add(key)
+            return clipped
+
+        accepts = evals = stalls = sweeps = 0
+        last_checkpoint_accepts = 0
+        t0 = time()
+        meaningful_gain = 1e-3
+        progress_anchor = best_proxy
+
+        while time() - t0 < budget:
+            sweeps += 1
+            sweep_accepts = 0
+            order = soft_order()
+            elapsed_frac = min(1.0, (time() - t0) / max(budget, 1e-6))
+            step_scale = canvas_norm * (0.025 * (1.0 - elapsed_frac) + 0.004 * elapsed_frac)
+
+            for i_raw in order:
+                if time() - t0 > budget:
+                    break
+                i = int(i_raw)
+                aff = macro_to_nets[i]
+                if len(aff) == 0:
+                    continue
+
+                old_x = float(cd_pos[i, 0])
+                old_y = float(cd_pos[i, 1])
+                old_hpwl = net_hpwl[aff].copy()
+
+                best_move = None
+                best_move_proxy = current_proxy
+                best_move_hpwl = None
+                best_move_delta = 0.0
+                best_move_den = current_den
+                best_move_cong = current_cong
+
+                for new_x, new_y in candidate_positions(i, step_scale):
+                    evals += 1
+                    apply_one(i, old_x, old_y, new_x, new_y)
+                    new_hpwl = _hpwl_batch(aff, ni_np, nm_np, cd_pos)
+                    wl_delta = float(((new_hpwl - old_hpwl) * nw_np[aff]).sum()) / (
+                        num_nets * canvas_norm
+                    )
+                    new_den = _density_cost_top5(density_grid)
+                    new_cong = cong_tracker.cost()
+                    cand_proxy = (
+                        total_wl + wl_delta
+                        + 0.5 * new_den * den_scale
+                        + 0.5 * new_cong * cong_scale
+                    )
+                    apply_one(i, new_x, new_y, old_x, old_y)
+
+                    if cand_proxy < best_move_proxy - 1e-6:
+                        best_move = (new_x, new_y)
+                        best_move_proxy = cand_proxy
+                        best_move_hpwl = new_hpwl.copy()
+                        best_move_delta = wl_delta
+                        best_move_den = new_den
+                        best_move_cong = new_cong
+
+                if best_move is None:
+                    continue
+
+                new_x, new_y = best_move
+                apply_one(i, old_x, old_y, new_x, new_y)
+                cd_placement[i, 0] = new_x
+                cd_placement[i, 1] = new_y
+                net_hpwl[aff] = best_move_hpwl
+                total_wl += best_move_delta
+                current_den = best_move_den
+                current_cong = best_move_cong
+                current_proxy = best_move_proxy
+                accepts += 1
+                sweep_accepts += 1
+
+                if accepts % checkpoint_every == 0:
+                    _set_placement(plc, cd_placement.detach(), benchmark)
+                    metrics = compute_proxy_cost(cd_placement.detach(), benchmark, plc)
+                    proxy = metrics["proxy_cost"]
+                    print(
+                        f"  soft_cd sweep={sweeps} accepts={accepts} evals={evals} "
+                        f"fast={current_proxy:.4f} proxy={proxy:.4f} "
+                        f"den={metrics['density_cost']:.4f} cong={metrics['congestion_cost']:.4f} "
+                        f"[{time()-t0:.0f}s]"
+                    )
+                    last_checkpoint_accepts = accepts
+                    den_scale = metrics["density_cost"] / (current_den + 1e-8)
+                    cong_scale = metrics["congestion_cost"] / (current_cong + 1e-8)
+                    current_proxy = (
+                        total_wl
+                        + 0.5 * current_den * den_scale
+                        + 0.5 * current_cong * cong_scale
+                    )
+                    if proxy < best_proxy:
+                        best_proxy = proxy
+                        best_placement = cd_placement.clone()
+                        if progress_anchor - best_proxy >= meaningful_gain:
+                            progress_anchor = best_proxy
+                            stalls = 0
+                        else:
+                            stalls += 1
+                    else:
+                        rebuild_fast_state(best_placement)
+                        _set_placement(plc, cd_placement.detach(), benchmark)
+                        best_metrics = compute_proxy_cost(cd_placement.detach(), benchmark, plc)
+                        den_scale = best_metrics["density_cost"] / (current_den + 1e-8)
+                        cong_scale = best_metrics["congestion_cost"] / (current_cong + 1e-8)
+                        current_proxy = (
+                            total_wl
+                            + 0.5 * current_den * den_scale
+                            + 0.5 * current_cong * cong_scale
+                        )
+                        stalls += 1
+                    if stalls >= 6:
+                        print("SA soft CD stalled")
+                        break
+
+            if stalls >= 6:
+                break
+            print(
+                f"  soft_cd sweep={sweeps} sweep_accepts={sweep_accepts} "
+                f"accepts={accepts} evals={evals} fast={current_proxy:.4f} "
+                f"best={best_proxy:.4f} [{time()-t0:.0f}s]"
+            )
+            if sweep_accepts == 0:
+                stalls += 1
+                if stalls >= 2:
+                    print("SA soft CD: no sweep improvements, stopping")
+                    break
+
+        if accepts > last_checkpoint_accepts:
+            _set_placement(plc, cd_placement.detach(), benchmark)
+            metrics = compute_proxy_cost(cd_placement.detach(), benchmark, plc)
+            proxy = metrics["proxy_cost"]
+            print(
+                f"  soft_cd final_chk accepts={accepts} evals={evals} "
+                f"proxy={proxy:.4f} best={best_proxy:.4f} [{time()-t0:.0f}s]"
+            )
+            if proxy < best_proxy:
+                best_proxy = proxy
+                best_placement = cd_placement.clone()
+
+        print(
+            f"SA soft CD done: sweeps={sweeps} accepts={accepts} "
+            f"evals={evals} best proxy={best_proxy:.4f}"
+        )
+        return best_placement
+
+    def _sa_soft_lns_repack(
+        self,
+        placement,
+        benchmark,
+        plc,
+        net_indices,
+        net_mask,
+        net_weights,
+        canvas_norm,
+        num_hard,
+        num_all,
+        fixed,
+        budget=300,
+        checkpoint_every=16,
+    ):
+        """Coordinated soft-macro LNS using incremental WL+density+HV proxy."""
+        num_soft = num_all - num_hard
+        if num_soft < 4:
+            return placement
+
+        sa_placement = placement.clone()
+        sa_pos, macro_to_nets, net_hpwl, _eval_delta, total_wl = self._build_incremental_wl(
+            net_indices, net_mask, net_weights, sa_placement, num_all, canvas_norm
+        )
+
+        soft_candidates = np.array(
+            [
+                i for i in range(num_hard, num_all)
+                if (not fixed[i].item()) and len(macro_to_nets[i]) > 0
+            ],
+            dtype=np.int32,
+        )
+        if soft_candidates.size < 4:
+            return placement
+
+        ni_np = net_indices.numpy().copy()
+        nm_np = net_mask.numpy().copy()
+        num_nets = ni_np.shape[0]
+        nw_np = net_weights.numpy().copy()
+        sizes_np = benchmark.macro_sizes[:num_all].numpy().copy()
+        hw_np = sizes_np[:, 0] / 2
+        hh_np = sizes_np[:, 1] / 2
+
+        bl = self._bin_left.numpy().copy()
+        br = self._bin_right.numpy().copy()
+        bb = self._bin_bottom.numpy().copy()
+        bt = self._bin_top.numpy().copy()
+        bin_w = float(self._bin_w)
+        bin_h = float(self._bin_h)
+        bin_area = bin_w * bin_h
+        n_rows = benchmark.grid_rows
+        n_cols = benchmark.grid_cols
+
+        density_grid = np.zeros((n_rows, n_cols), dtype=np.float32)
+        _build_density_grid(
+            density_grid, sa_pos, sizes_np, num_all, bl, br, bb, bt,
+            bin_area, n_rows, n_cols, bin_w, bin_h,
+        )
+
+        hcap = max(1e-6, bin_h * float(getattr(benchmark, "hroutes_per_micron", 1.0) or 1.0))
+        vcap = max(1e-6, bin_w * float(getattr(benchmark, "vroutes_per_micron", 1.0) or 1.0))
+        try:
+            smooth_range = int(plc.get_congestion_smooth_range())
+        except Exception:
+            smooth_range = int(getattr(plc, "smooth_range", 2) or 2)
+        smooth_range = max(0, smooth_range)
+        try:
+            h_alloc, v_alloc = plc.get_macro_routing_allocation()
+        except Exception:
+            h_alloc = float(getattr(plc, "hrouting_alloc", 0.0) or 0.0)
+            v_alloc = float(getattr(plc, "vrouting_alloc", 0.0) or 0.0)
+        h_alloc = float(h_alloc)
+        v_alloc = float(v_alloc)
+
+        h_route_grid = np.zeros((n_rows, n_cols), dtype=np.float32)
+        v_route_grid = np.zeros((n_rows, n_cols), dtype=np.float32)
+        h_macro_grid = np.zeros((n_rows, n_cols), dtype=np.float32)
+        v_macro_grid = np.zeros((n_rows, n_cols), dtype=np.float32)
+
+        _pin_tensors = build_pin_route_tensors(benchmark)
+        _use_pin_routing = _pin_tensors is not None
+        if _use_pin_routing:
+            pin_owner_p, pin_mask_p, pin_xoff_p, pin_yoff_p, pin_fx_p, pin_fy_p, nw_p = _pin_tensors
+            macro_to_pin_nets = build_macro_to_pin_nets(benchmark, num_all)
+            num_pin_nets = pin_owner_p.shape[0]
+            _build_pin_hv_route_grid(
+                h_route_grid, v_route_grid,
+                pin_owner_p, pin_mask_p, pin_xoff_p, pin_yoff_p, pin_fx_p, pin_fy_p, nw_p,
+                sa_pos, num_pin_nets, bin_w, bin_h, n_rows, n_cols, hcap, vcap,
+            )
+        else:
+            _build_hv_route_grid(
+                h_route_grid, v_route_grid, ni_np, nm_np, nw_np, sa_pos, num_nets,
+                bin_w, bin_h, n_rows, n_cols, hcap, vcap,
+            )
+        _build_macro_route_grid(
+            h_macro_grid, v_macro_grid, sa_pos, sizes_np, num_hard, bl, br, bb, bt,
+            n_rows, n_cols, bin_w, bin_h, hcap, vcap, h_alloc, v_alloc,
+        )
+        cong_tracker = SmoothHVCostTracker(
+            h_route_grid, v_route_grid, h_macro_grid, v_macro_grid, smooth_range
+        )
+
+        current_den = _density_cost_top5(density_grid)
+        current_cong = cong_tracker.cost()
+        _set_placement(plc, sa_placement.detach(), benchmark)
+        real_metrics = compute_proxy_cost(sa_placement.detach(), benchmark, plc)
+        best_proxy = real_metrics["proxy_cost"]
+        den_scale = real_metrics["density_cost"] / (current_den + 1e-8)
+        cong_scale = real_metrics["congestion_cost"] / (current_cong + 1e-8)
+        current_proxy = (
+            total_wl
+            + 0.5 * current_den * den_scale
+            + 0.5 * current_cong * cong_scale
+        )
+        best_placement = sa_placement.clone()
+        print(
+            f"SA soft LNS start: proxy={best_proxy:.4f} fast={current_proxy:.4f} "
+            f"wl={total_wl:.4f} num_soft={num_soft} candidates={soft_candidates.size} "
+            f"(HV cong, smooth={smooth_range})"
+        )
+
+        def rebuild_fast_state(from_tensor):
+            nonlocal sa_placement, sa_pos, net_hpwl, total_wl
+            nonlocal current_den, current_cong, current_proxy, cong_tracker
+            sa_placement = from_tensor.clone()
+            sa_pos[:] = sa_placement.detach().numpy()
+            net_hpwl[:] = _hpwl_batch(np.arange(num_nets, dtype=np.int32), ni_np, nm_np, sa_pos)
+            total_wl = float((net_hpwl * nw_np).sum()) / (num_nets * canvas_norm)
+            density_grid[:] = 0
+            _build_density_grid(
+                density_grid, sa_pos, sizes_np, num_all, bl, br, bb, bt,
+                bin_area, n_rows, n_cols, bin_w, bin_h,
+            )
+            h_route_grid[:] = 0
+            v_route_grid[:] = 0
+            if _use_pin_routing:
+                _build_pin_hv_route_grid(
+                    h_route_grid, v_route_grid,
+                    pin_owner_p, pin_mask_p, pin_xoff_p, pin_yoff_p, pin_fx_p, pin_fy_p, nw_p,
+                    sa_pos, num_pin_nets, bin_w, bin_h, n_rows, n_cols, hcap, vcap,
+                )
+            else:
+                _build_hv_route_grid(
+                    h_route_grid, v_route_grid, ni_np, nm_np, nw_np, sa_pos, num_nets,
+                    bin_w, bin_h, n_rows, n_cols, hcap, vcap,
+                )
+            cong_tracker = SmoothHVCostTracker(
+                h_route_grid, v_route_grid, h_macro_grid, v_macro_grid, smooth_range
+            )
+            current_den = _density_cost_top5(density_grid)
+            current_cong = cong_tracker.cost()
+            current_proxy = (
+                total_wl
+                + 0.5 * current_den * den_scale
+                + 0.5 * current_cong * cong_scale
+            )
+
+        def pressure_for(indices):
+            rows = np.clip((sa_pos[indices, 1] / bin_h).astype(np.int64), 0, n_rows - 1)
+            cols = np.clip((sa_pos[indices, 0] / bin_w).astype(np.int64), 0, n_cols - 1)
+            cong_pressure = 0.5 * (cong_tracker.h_smooth[rows, cols] + cong_tracker.v_smooth[rows, cols])
+            return density_grid[rows, cols] + cong_pressure
+
+        def macro_barycenter(i):
+            sx = sy = sw = 0.0
+            for n in macro_to_nets[i]:
+                w = float(nw_np[n])
+                for d in range(ni_np.shape[1]):
+                    if not nm_np[n, d]:
+                        break
+                    j = int(ni_np[n, d])
+                    if j == i:
+                        continue
+                    sx += float(sa_pos[j, 0]) * w
+                    sy += float(sa_pos[j, 1]) * w
+                    sw += w
+            if sw <= 0.0:
+                return sa_pos[i].copy()
+            return np.array([sx / sw, sy / sw], dtype=np.float32)
+
+        def choose_group():
+            sample_n = min(96, soft_candidates.size)
+            sample = np.random.choice(soft_candidates, size=sample_n, replace=False)
+            p = pressure_for(sample)
+            center = int(sample[int(np.argmax(p + 0.01 * np.random.random(size=p.shape)))])
+            k_min = min(8, soft_candidates.size)
+            k_max = min(28, soft_candidates.size)
+            if k_max <= k_min:
+                k = k_min
+            else:
+                k = random.randint(k_min, k_max)
+            dx = sa_pos[soft_candidates, 0] - sa_pos[center, 0]
+            dy = sa_pos[soft_candidates, 1] - sa_pos[center, 1]
+            dist2 = dx * dx + dy * dy
+            pool_n = min(soft_candidates.size, max(k * 4, k + 1))
+            pool_idx = np.argpartition(dist2, pool_n - 1)[:pool_n]
+            pool = soft_candidates[pool_idx]
+            group = np.random.choice(pool, size=k, replace=False).astype(np.int32)
+            if center not in group:
+                group[0] = center
+            return np.unique(group).astype(np.int32)
+
+        def propose_group(group, move_scale):
+            old_xy = sa_pos[group].copy()
+            new_xy = old_xy.copy()
+            center_xy = old_xy.mean(axis=0)
+            mode = random.random()
+
+            if mode < 0.35 and group.size >= 3:
+                slots = old_xy.copy()
+                bvec = np.array([macro_barycenter(int(i)) for i in group], dtype=np.float32)
+                macro_angles = np.arctan2(bvec[:, 1] - center_xy[1], bvec[:, 0] - center_xy[0])
+                slot_angles = np.arctan2(slots[:, 1] - center_xy[1], slots[:, 0] - center_xy[0])
+                macro_order = np.argsort(macro_angles)
+                slot_order = np.argsort(slot_angles)
+                new_xy[macro_order] = slots[slot_order]
+            elif mode < 0.55 and group.size >= 2:
+                new_xy = old_xy[np.random.permutation(group.size)].copy()
+            elif mode < 0.75:
+                vec = old_xy - center_xy
+                norm = np.linalg.norm(vec, axis=1)
+                tiny = norm < 1e-6
+                if tiny.any():
+                    vec[tiny] = np.random.uniform(-1.0, 1.0, size=(int(tiny.sum()), 2))
+                scale = random.uniform(1.15, 1.75)
+                jitter = np.random.uniform(-0.35 * move_scale, 0.35 * move_scale, size=old_xy.shape)
+                new_xy = center_xy + scale * vec + jitter
+            elif mode < 0.90:
+                for idx, i in enumerate(group):
+                    bary = macro_barycenter(int(i))
+                    step = random.uniform(0.25, 0.65)
+                    jitter = np.random.uniform(-0.25 * move_scale, 0.25 * move_scale, size=2)
+                    new_xy[idx] = old_xy[idx] + step * (bary - old_xy[idx]) + jitter
+            else:
+                pressure_grid = density_grid + 0.5 * (cong_tracker.h_smooth + cong_tracker.v_smooth)
+                x0 = max(0, int((old_xy[:, 0].min() - 2.0 * move_scale) / bin_w))
+                x1 = min(n_cols - 1, int((old_xy[:, 0].max() + 2.0 * move_scale) / bin_w))
+                y0 = max(0, int((old_xy[:, 1].min() - 2.0 * move_scale) / bin_h))
+                y1 = min(n_rows - 1, int((old_xy[:, 1].max() + 2.0 * move_scale) / bin_h))
+                sub = pressure_grid[y0 : y1 + 1, x0 : x1 + 1]
+                if sub.size > 0:
+                    low_n = min(max(4, group.size * 3), sub.size)
+                    low_flat = np.argpartition(sub.reshape(-1), low_n - 1)[:low_n]
+                    for idx in range(group.size):
+                        pick = int(random.choice(low_flat))
+                        rr = y0 + pick // sub.shape[1]
+                        cc = x0 + pick % sub.shape[1]
+                        new_xy[idx, 0] = (cc + random.uniform(0.2, 0.8)) * bin_w
+                        new_xy[idx, 1] = (rr + random.uniform(0.2, 0.8)) * bin_h
+
+            for idx, i in enumerate(group):
+                ii = int(i)
+                new_xy[idx, 0] = np.clip(new_xy[idx, 0], hw_np[ii], benchmark.canvas_width - hw_np[ii])
+                new_xy[idx, 1] = np.clip(new_xy[idx, 1], hh_np[ii], benchmark.canvas_height - hh_np[ii])
+            return old_xy, new_xy
+
+        def apply_one(i, old_x, old_y, new_x, new_y):
+            sa_pos[i, 0] = new_x
+            sa_pos[i, 1] = new_y
+            _update_density_incr(
+                density_grid, old_x, old_y, new_x, new_y,
+                hw_np[i], hh_np[i], bl, br, bb, bt, bin_area, n_rows, n_cols, bin_w, bin_h,
+            )
+            if _use_pin_routing:
+                pin_aff = macro_to_pin_nets[i]
+                if len(pin_aff) > 0:
+                    update_pin_hv_route_incr_single_smooth(
+                        h_route_grid, v_route_grid, cong_tracker,
+                        pin_owner_p, pin_mask_p, pin_xoff_p, pin_yoff_p, pin_fx_p, pin_fy_p, nw_p,
+                        sa_pos, pin_aff, i, old_x, old_y,
+                        bin_w, bin_h, n_rows, n_cols, hcap, vcap,
+                    )
+            else:
+                aff_i = macro_to_nets[i]
+                if len(aff_i) > 0:
+                    update_hv_route_incr_single_smooth(
+                        h_route_grid, v_route_grid, cong_tracker,
+                        ni_np, nm_np, nw_np, sa_pos, aff_i, i, old_x, old_y,
+                        bin_w, bin_h, n_rows, n_cols, hcap, vcap,
+                    )
+
+        accepts = trials = stalls = 0
+        last_accept_trial = 0
+        last_checkpoint_accepts = 0
+        t0 = time()
+        meaningful_gain = 1e-3
+        progress_anchor = best_proxy
+
+        while time() - t0 < budget:
+            elapsed_frac = min(1.0, (time() - t0) / max(budget, 1e-6))
+            move_scale = canvas_norm * (0.045 * (1.0 - elapsed_frac) + 0.010 * elapsed_frac)
+            group = choose_group()
+            if group.size < 2:
+                continue
+
+            aff_parts = [macro_to_nets[int(i)] for i in group if len(macro_to_nets[int(i)]) > 0]
+            if not aff_parts:
+                continue
+            aff = np.unique(np.concatenate(aff_parts)).astype(np.int32)
+            if aff.size == 0:
+                continue
+
+            trials += 1
+            old_xy, new_xy = propose_group(group, move_scale)
+            if np.max(np.abs(new_xy - old_xy)) < 1e-5:
+                continue
+
+            old_hpwl = net_hpwl[aff].copy()
+            for idx, i in enumerate(group):
+                apply_one(
+                    int(i),
+                    float(old_xy[idx, 0]),
+                    float(old_xy[idx, 1]),
+                    float(new_xy[idx, 0]),
+                    float(new_xy[idx, 1]),
+                )
+
+            new_hpwl = _hpwl_batch(aff, ni_np, nm_np, sa_pos)
+            wl_delta = float((new_hpwl - old_hpwl).sum()) / (num_nets * canvas_norm)
+            new_den = _density_cost_top5(density_grid)
+            new_cong = cong_tracker.cost()
+            new_proxy = (
+                total_wl + wl_delta
+                + 0.5 * new_den * den_scale
+                + 0.5 * new_cong * cong_scale
+            )
+
+            if new_proxy < current_proxy - 1e-6:
+                for idx, i in enumerate(group):
+                    sa_placement[int(i), 0] = float(new_xy[idx, 0])
+                    sa_placement[int(i), 1] = float(new_xy[idx, 1])
+                net_hpwl[aff] = new_hpwl
+                total_wl += wl_delta
+                current_den = new_den
+                current_cong = new_cong
+                current_proxy = new_proxy
+                accepts += 1
+                last_accept_trial = trials
+
+                if accepts % checkpoint_every == 0:
+                    _set_placement(plc, sa_placement.detach(), benchmark)
+                    metrics = compute_proxy_cost(sa_placement.detach(), benchmark, plc)
+                    proxy = metrics["proxy_cost"]
+                    print(
+                        f"  lns trials={trials} accepts={accepts} size={group.size} "
+                        f"fast={current_proxy:.4f} proxy={proxy:.4f} "
+                        f"den={metrics['density_cost']:.4f} cong={metrics['congestion_cost']:.4f} "
+                        f"[{time()-t0:.0f}s]"
+                    )
+                    last_checkpoint_accepts = accepts
+                    den_scale = metrics["density_cost"] / (current_den + 1e-8)
+                    cong_scale = metrics["congestion_cost"] / (current_cong + 1e-8)
+                    current_proxy = (
+                        total_wl
+                        + 0.5 * current_den * den_scale
+                        + 0.5 * current_cong * cong_scale
+                    )
+                    if proxy < best_proxy:
+                        best_proxy = proxy
+                        best_placement = sa_placement.clone()
+                        if progress_anchor - best_proxy >= meaningful_gain:
+                            progress_anchor = best_proxy
+                            stalls = 0
+                        else:
+                            stalls += 1
+                    else:
+                        rebuild_fast_state(best_placement)
+                        _set_placement(plc, sa_placement.detach(), benchmark)
+                        best_metrics = compute_proxy_cost(sa_placement.detach(), benchmark, plc)
+                        den_scale = best_metrics["density_cost"] / (current_den + 1e-8)
+                        cong_scale = best_metrics["congestion_cost"] / (current_cong + 1e-8)
+                        current_proxy = (
+                            total_wl
+                            + 0.5 * current_den * den_scale
+                            + 0.5 * current_cong * cong_scale
+                        )
+                        stalls += 1
+                    if stalls >= 6:
+                        print("SA soft LNS stalled")
+                        break
+            else:
+                for idx in range(group.size - 1, -1, -1):
+                    i = int(group[idx])
+                    apply_one(
+                        i,
+                        float(new_xy[idx, 0]),
+                        float(new_xy[idx, 1]),
+                        float(old_xy[idx, 0]),
+                        float(old_xy[idx, 1]),
+                    )
+
+            if trials % 2000 == 0:
+                print(
+                    f"  lns trials={trials} accepts={accepts} fast={current_proxy:.4f} "
+                    f"best={best_proxy:.4f} move={move_scale/canvas_norm:.4f} "
+                    f"[{time()-t0:.0f}s]",
+                    end="\r",
+                )
+            if trials - last_accept_trial > 100_000:
+                print("SA soft LNS: no accepts in 100k trials, stopping")
+                break
+
+        if accepts > last_checkpoint_accepts:
+            _set_placement(plc, sa_placement.detach(), benchmark)
+            metrics = compute_proxy_cost(sa_placement.detach(), benchmark, plc)
+            proxy = metrics["proxy_cost"]
+            print(
+                f"  lns final_chk accepts={accepts} trials={trials} "
+                f"proxy={proxy:.4f} best={best_proxy:.4f} [{time()-t0:.0f}s]"
+            )
+            if proxy < best_proxy:
+                best_proxy = proxy
+                best_placement = sa_placement.clone()
+
+        print(
+            f"SA soft LNS done: {trials} trials, {accepts} accepts, "
+            f"best proxy={best_proxy:.4f}"
+        )
+        return best_placement
+
     def _sa_soft_displace(
         self,
         placement,
@@ -2690,6 +3597,8 @@ class HybridAnalyticalPlacer:
         check_interval = 500_000
         last_check_accepts = 0
         min_rate = 5e-5
+        meaningful_gain = 1e-3
+        progress_anchor = best_proxy
 
         def rebuild_fast_state(from_tensor):
             nonlocal sa_placement, sa_pos, net_hpwl, total_wl
@@ -2844,7 +3753,17 @@ class HybridAnalyticalPlacer:
                     if proxy < best_proxy:
                         best_proxy = proxy
                         best_placement = sa_placement.clone()
-                        stalls = 0
+                        if progress_anchor - best_proxy >= meaningful_gain:
+                            progress_anchor = best_proxy
+                            stalls = 0
+                        else:
+                            stalls += 1
+                            if stalls >= 8:
+                                print(
+                                    f"SA soft displace stalled "
+                                    f"(<{meaningful_gain:.4f} gain over recent checkpoints)"
+                                )
+                                break
                     else:
                         rebuild_fast_state(best_placement)
                         _set_placement(plc, sa_placement.detach(), benchmark)
@@ -2857,7 +3776,7 @@ class HybridAnalyticalPlacer:
                             + 0.5 * current_cong * cong_scale
                         )
                         stalls += 1
-                        if stalls >= 6:
+                        if stalls >= 8:
                             print("SA soft displace stalled")
                             break
             else:

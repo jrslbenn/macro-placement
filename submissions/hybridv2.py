@@ -487,7 +487,7 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
         das_max_amp: float = 4.0,
         # ── Channel relocate ──
         ch_enable: bool = True,
-        ch_budget: float = 240.0,
+        ch_budget: float = 180.0,
         ch_max_stale_sweeps: int = 3,
         ch_max_stale_checkpoints: int = 3,
         ch_checkpoint_accepts: int = 24,
@@ -497,10 +497,10 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
         # Same algorithm as hard channel relocate, but operating on
         # standard-cell clusters [num_hard, num_all). No overlap check
         # (soft macros pile up — cost is density, not legality), no
-        # macro-route updates (hard macros stay fixed). Designed to give
-        # the soft sea long-range relocation capability so it can escape
-        # the post-Nesterov basin and clear wire-nests.
-        sch_enable: bool = True,
+        # macro-route updates (hard macros stay fixed). This was only a
+        # tiny win in the incremental-real-eval sweep, so keep it as an
+        # opt-in experiment and spend default runtime on stronger stages.
+        sch_enable: bool = False,
         sch_budget: float = 180.0,
         sch_max_stale_sweeps: int = 3,
         sch_max_stale_checkpoints: int = 3,
@@ -514,7 +514,10 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
         # congestion-bound benches (ibm17/18) where channel relocate
         # alone stalls because the bottleneck is downstream of where
         # hard-macro moves operate.
-        polish_enable: bool = True,
+        # Disabled by default after the incremental-real-eval sweep: every
+        # logged IBM run restored the pre-polish best checkpoint, so this is
+        # currently an experiment knob rather than a productive stage.
+        polish_enable: bool = False,
         # On cong-bound benches (ibm17/18) channel relocate stalls
         # immediately because congestion is global (no low-pressure
         # target bins exist for single-macro relocation). Polish is the
@@ -2254,26 +2257,31 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
         )
         self._save_v2_stage(plc, benchmark, refined, "08_channel")
 
-        # Soft channel relocate: long-range moves for soft macros to
-        # escape the post-Nesterov basin and clear wire-nests.
-        soft_relocated = self._soft_channel_relocate(
-            refined, benchmark, plc, nets,
-            net_indices, net_mask, net_weights, canvas_norm,
-            budget=self.sch_budget,
-        )
-        self._save_v2_stage(plc, benchmark, soft_relocated, "09_soft_channel")
+        # Soft channel relocate is opt-in. It measured as a tiny gain on
+        # only two IBM benches, so default runs skip it.
+        soft_relocated = refined
+        if self.sch_enable:
+            soft_relocated = self._soft_channel_relocate(
+                refined, benchmark, plc, nets,
+                net_indices, net_mask, net_weights, canvas_norm,
+                budget=self.sch_budget,
+            )
+            self._save_v2_stage(plc, benchmark, soft_relocated, "09_soft_channel")
 
-        # Post-channel constrained Nesterov polish: final gradient settle
-        # with congestion-awareness for both hard (tethered) and soft.
-        polished = self._post_channel_polish(
-            soft_relocated, benchmark, plc, nets,
-            net_indices, net_mask, net_weights, canvas_norm,
-        )
-        self._save_v2_stage(plc, benchmark, polished, "10_polish")
+        # Post-channel polish is opt-in. The current incremental-real-eval
+        # logs show it consistently restores the incoming checkpoint, so the
+        # default submission path spends this time elsewhere.
+        polished = soft_relocated
+        if self.polish_enable:
+            polished = self._post_channel_polish(
+                soft_relocated, benchmark, plc, nets,
+                net_indices, net_mask, net_weights, canvas_norm,
+            )
+            self._save_v2_stage(plc, benchmark, polished, "10_polish")
 
         # Safety: ensure no overlaps slipped through either stage.
         if self._hard_overlap_count(polished, benchmark) > 0:
-            print("[v2] polish left overlaps, legalizing")
+            print("[v2] final v2 placement has overlaps, legalizing")
             polished = self._legalize_fast(polished, benchmark, gap=0.01, max_iters=400)
             if self._hard_overlap_count(polished, benchmark) > 0:
                 polished = strong_legalize(polished, benchmark, gap=0.02, max_iters=80)
