@@ -88,6 +88,75 @@ class ProgressGate:
         )
 
 
+class WindowProgressGate:
+    """
+    Stop a noisy stage only after whole windows fail to improve best-so-far.
+
+    Raw checkpoints can bounce around; this gate looks at the best value seen
+    inside a window and asks whether it beat the window anchor by `epsilon`.
+    """
+    __slots__ = (
+        "window",
+        "epsilon",
+        "min_time",
+        "max_patience",
+        "patience",
+        "best",
+        "anchor_best",
+        "seen",
+        "history",
+    )
+
+    def __init__(
+        self,
+        window: int = 5,
+        patience_windows: int = 2,
+        epsilon: float = 0.003,
+        min_time: float = 0.0,
+        initial_best: float = float("inf"),
+    ):
+        self.window = max(1, int(window))
+        self.epsilon = float(epsilon)
+        self.min_time = max(0.0, float(min_time))
+        self.max_patience = max(1, int(patience_windows))
+        self.patience = self.max_patience
+        self.best = float(initial_best)
+        self.anchor_best = float(initial_best)
+        self.seen = 0
+        self.history: List[Tuple[str, float, int]] = []
+
+    def update(self, proxy: float, elapsed: Optional[float] = None) -> Tuple[bool, bool]:
+        improved = proxy < self.best - 1e-4
+        if improved:
+            self.best = float(proxy)
+
+        self.seen += 1
+        if self.seen < self.window:
+            self.history.append(("?", float(proxy), self.patience))
+            return improved, False
+
+        gain = self.anchor_best - self.best
+        elapsed_ok = elapsed is None or elapsed >= self.min_time
+        if gain >= self.epsilon:
+            self.patience = self.max_patience
+            mark = "+"
+        else:
+            mark = "."
+            if elapsed_ok:
+                self.patience -= 1
+
+        self.anchor_best = self.best
+        self.seen = 0
+        self.history.append((mark, float(proxy), self.patience))
+        return improved, elapsed_ok and self.patience <= 0
+
+    def __repr__(self) -> str:
+        return (
+            f"WindowProgressGate(patience={self.patience}/{self.max_patience}, "
+            f"best={self.best:.4f}, anchor={self.anchor_best:.4f}, seen={self.seen}/{self.window})"
+        )
+
+
 def strong_legalize(placement, benchmark, gap=0.021, max_iters=200):
     """
     Push overlapping hard macros apart with minimum displacement.
@@ -1113,6 +1182,10 @@ class HybridAnalyticalPlacer:
         # larger repacks inside congested soft neighborhoods, but only keep
         # real-proxy-improving checkpoints.
         enable_soft_lns: bool = False,
+        # Hot-region soft untwist. Kept as an opt-in experiment: on the
+        # incremental-real-eval sweep it repeatedly spent real checkpoints
+        # without accepting moves on early IBM benches.
+        enable_soft_untwist: bool = False,
         # Soft macro coordinate descent / line search. This is the cautious
         # follow-up to soft displace: one soft macro at a time, many targeted
         # candidate positions, same incremental real-ish proxy and real-proxy
@@ -1139,6 +1212,7 @@ class HybridAnalyticalPlacer:
         self.inflation_soft_cap = inflation_soft_cap
         self.enable_soft_spread = enable_soft_spread
         self.enable_soft_lns = enable_soft_lns
+        self.enable_soft_untwist = enable_soft_untwist
         self.enable_soft_cd = enable_soft_cd
 
     def place(self, benchmark: Benchmark) -> torch.Tensor:
@@ -1250,7 +1324,7 @@ class HybridAnalyticalPlacer:
         log_every = max(1, self.num_steps // 20)
         track_every = max(1, self.num_steps // 50)
         plc_synced_at = -1
-        K = 5
+        K = 3
         recent_proxies = []
         top_k_candidates = []
 
@@ -1272,10 +1346,10 @@ class HybridAnalyticalPlacer:
             top_k_candidates.append((initial_proxy, -1, placement.detach().clone()))
 
         start_time = time()
-        total_time_budget = 1800
-        hard_time_budget = 2100
+        total_time_budget = 3000
+        hard_time_budget = 3000
         min_stage_budget = 120
-        nesterov_time_budget = 360
+        nesterov_time_budget = 300
         step = 0
         track_proxies = []
         print("starting iters")
@@ -1596,7 +1670,7 @@ class HybridAnalyticalPlacer:
 
             if benchmark.num_soft_macros > 1:
                 remaining = total_time_budget - (time() - start_time)
-                soft_swap_budget = stage_budget("SA soft swap", max_budget=90)
+                soft_swap_budget = stage_budget("SA soft swap", max_budget=240)
                 print(
                     f"SA soft swap budget: {soft_swap_budget:.0f}s "
                     f"(elapsed={time()-start_time:.1f}s remaining={remaining:.1f}s)"
@@ -1613,6 +1687,9 @@ class HybridAnalyticalPlacer:
                         num_hard,
                         num_all,
                         budget=soft_swap_budget,
+                        base_budget=90,
+                        extension_budget=60,
+                        extension_gain=0.002,
                         checkpoint_every=100,
                     )
                     _save_plot("03_sa_soft_swap", best_valid_placement)
@@ -1648,7 +1725,7 @@ class HybridAnalyticalPlacer:
                     print("Soft spread disabled")
 
                 remaining = total_time_budget - (time() - start_time)
-                soft_displace_budget = stage_budget("SA soft displace", max_budget=600)
+                soft_displace_budget = stage_budget("SA soft displace", max_budget=1200)
                 print(
                     f"SA soft displace budget: {soft_displace_budget:.0f}s "
                     f"(elapsed={time()-start_time:.1f}s remaining={remaining:.1f}s)"
@@ -1674,7 +1751,7 @@ class HybridAnalyticalPlacer:
 
                 if self.enable_soft_cd:
                     remaining = total_time_budget - (time() - start_time)
-                    soft_cd_budget = stage_budget("SA soft CD", max_budget=240)
+                    soft_cd_budget = stage_budget("SA soft CD", max_budget=900)
                     print(
                         f"SA soft CD budget: {soft_cd_budget:.0f}s "
                         f"(elapsed={time()-start_time:.1f}s remaining={remaining:.1f}s)"
@@ -1692,6 +1769,9 @@ class HybridAnalyticalPlacer:
                             num_all,
                             fixed,
                             budget=soft_cd_budget,
+                            base_budget=240,
+                            extension_budget=120,
+                            extension_gain=2e-3,
                             checkpoint_every=60,
                         )
                         _save_plot("05b_soft_cd", best_valid_placement)
@@ -1699,6 +1779,33 @@ class HybridAnalyticalPlacer:
                         print("SA soft CD skipped: no remaining budget")
                 else:
                     print("SA soft CD disabled")
+
+                if self.enable_soft_untwist:
+                    remaining = total_time_budget - (time() - start_time)
+                    soft_untwist_budget = stage_budget("Soft untwist", max_budget=180)
+                    print(
+                        f"Soft untwist budget: {soft_untwist_budget:.0f}s "
+                        f"(elapsed={time()-start_time:.1f}s remaining={remaining:.1f}s)"
+                    )
+                    if soft_untwist_budget > 0:
+                        best_valid_placement = self._soft_hot_untwist_refine(
+                            best_valid_placement,
+                            benchmark,
+                            plc,
+                            net_indices,
+                            net_mask,
+                            net_weights,
+                            canvas_norm,
+                            num_hard,
+                            num_all,
+                            fixed,
+                            budget=soft_untwist_budget,
+                        )
+                        _save_plot("05c_soft_untwist", best_valid_placement)
+                    else:
+                        print("Soft untwist skipped: no remaining budget")
+                else:
+                    print("Soft untwist disabled")
 
                 if self.enable_soft_lns:
                     remaining = total_time_budget - (time() - start_time)
@@ -1922,6 +2029,13 @@ class HybridAnalyticalPlacer:
             accepts = total = stalls = 0
             last_accept_step = 0
             t0 = time()
+            progress_gate = WindowProgressGate(
+                window=3,
+                patience_windows=1,
+                epsilon=0.0010,
+                min_time=min(180.0, max(0.0, float(budget))),
+                initial_best=best_proxy,
+            )
             max_displacement = canvas_norm * 0.03
 
             for _ in range(100_000_000):
@@ -2040,6 +2154,7 @@ class HybridAnalyticalPlacer:
                         cong_scale = real_metrics['congestion_cost'] / (current_cong + 1e-8)
                         current_proxy = total_wl + 0.5 * (current_den * den_scale) + .5 * (current_cong * cong_scale)
                         print(f"  step={total} accepts={accepts} wl={total_wl:.4f} fast={current_proxy:.4f} real={real_proxy:.4f} den_s={den_scale:.4f} cong_s={cong_scale:.4f} [{time()-t0:.0f}s]")
+                        _, gate_stop = progress_gate.update(real_proxy, time() - t0)
                         if real_proxy < best_proxy:
                             best_proxy = real_proxy
                             best_placement = sa_placement.clone()
@@ -2077,9 +2192,13 @@ class HybridAnalyticalPlacer:
                             cong_scale = best_metrics['congestion_cost'] / (current_cong + 1e-8)
                             current_proxy = total_wl + 0.5 * (current_den * den_scale) + .5 * (current_cong * cong_scale)
                             stalls += 1
-                            if stalls >= 6:
-                                print("SA displace stalled")
-                                break
+                        if gate_stop:
+                            print(
+                                f"SA displace stalled "
+                                f"(window gate, best={progress_gate.best:.4f}, "
+                                f"patience={progress_gate.patience}/{progress_gate.max_patience})"
+                            )
+                            break
                 else:
                     new_x = float(sa_pos[i, 0])
                     new_y = float(sa_pos[i, 1])
@@ -2331,6 +2450,9 @@ class HybridAnalyticalPlacer:
         num_hard,
         num_all,
         budget=60,
+        base_budget=90,
+        extension_budget=60,
+        extension_gain=0.002,
         checkpoint_every=100,
     ):
         """Greedy pairwise soft macro swaps with real-proxy checkpoint/revert."""
@@ -2354,9 +2476,16 @@ class HybridAnalyticalPlacer:
         accepts = total = stalls = 0
         last_accept_step = 0
         t0 = time()
+        max_budget = max(0.0, float(budget))
+        active_budget = min(max_budget, max(0.0, float(base_budget)))
+        extension_budget = max(0.0, float(extension_budget))
+        extension_anchor = best_proxy
+        if active_budget <= 0.0:
+            print("SA soft swap skipped: no active budget")
+            return placement
 
         for _ in range(100_000_000):
-            if time() - t0 > budget:
+            if time() - t0 > active_budget:
                 break
             if total % 100000 == 0 and total > 0:
                 print(
@@ -2396,6 +2525,18 @@ class HybridAnalyticalPlacer:
                         best_proxy = proxy
                         best_placement = sa_placement.clone()
                         stalls = 0
+                        if (
+                            extension_anchor - best_proxy >= extension_gain
+                            and extension_budget > 0.0
+                            and active_budget < max_budget - 1e-6
+                        ):
+                            old_budget = active_budget
+                            active_budget = min(max_budget, active_budget + extension_budget)
+                            extension_anchor = best_proxy
+                            print(
+                                f"  soft_swap extend: {old_budget:.0f}s->{active_budget:.0f}s "
+                                f"best={best_proxy:.4f} [{time()-t0:.0f}s]"
+                            )
                     else:
                         sa_placement = best_placement.clone()
                         sa_pos[:] = best_placement.detach().numpy()
@@ -2658,6 +2799,9 @@ class HybridAnalyticalPlacer:
         num_all,
         fixed,
         budget=240,
+        base_budget=240,
+        extension_budget=120,
+        extension_gain=2e-3,
         checkpoint_every=60,
     ):
         """Soft-macro coordinate descent with incremental WL+density+HV proxy."""
@@ -2914,18 +3058,31 @@ class HybridAnalyticalPlacer:
         accepts = evals = stalls = sweeps = 0
         last_checkpoint_accepts = 0
         t0 = time()
-        meaningful_gain = 1e-3
-        progress_anchor = best_proxy
+        max_budget = max(0.0, float(budget))
+        active_budget = min(max_budget, max(0.0, float(base_budget)))
+        extension_budget = max(0.0, float(extension_budget))
+        extension_anchor = best_proxy
+        progress_gate = WindowProgressGate(
+            window=5,
+            patience_windows=2,
+            epsilon=0.002,
+            min_time=min(240.0, active_budget),
+            initial_best=best_proxy,
+        )
+        if active_budget <= 0.0:
+            print("SA soft CD skipped: no active budget")
+            return placement
 
-        while time() - t0 < budget:
+        stop_cd = False
+        while time() - t0 < active_budget:
             sweeps += 1
             sweep_accepts = 0
             order = soft_order()
-            elapsed_frac = min(1.0, (time() - t0) / max(budget, 1e-6))
+            elapsed_frac = min(1.0, (time() - t0) / max(active_budget, 1e-6))
             step_scale = canvas_norm * (0.025 * (1.0 - elapsed_frac) + 0.004 * elapsed_frac)
 
             for i_raw in order:
-                if time() - t0 > budget:
+                if time() - t0 > active_budget:
                     break
                 i = int(i_raw)
                 aff = macro_to_nets[i]
@@ -3000,14 +3157,23 @@ class HybridAnalyticalPlacer:
                         + 0.5 * current_den * den_scale
                         + 0.5 * current_cong * cong_scale
                     )
+                    _, gate_stop = progress_gate.update(proxy, time() - t0)
                     if proxy < best_proxy:
                         best_proxy = proxy
                         best_placement = cd_placement.clone()
-                        if progress_anchor - best_proxy >= meaningful_gain:
-                            progress_anchor = best_proxy
-                            stalls = 0
-                        else:
-                            stalls += 1
+                        stalls = 0
+                        if (
+                            extension_anchor - best_proxy >= extension_gain
+                            and extension_budget > 0.0
+                            and active_budget < max_budget - 1e-6
+                        ):
+                            old_budget = active_budget
+                            active_budget = min(max_budget, active_budget + extension_budget)
+                            extension_anchor = best_proxy
+                            print(
+                                f"  soft_cd extend: {old_budget:.0f}s->{active_budget:.0f}s "
+                                f"best={best_proxy:.4f} [{time()-t0:.0f}s]"
+                            )
                     else:
                         rebuild_fast_state(best_placement)
                         _set_placement(plc, cd_placement.detach(), benchmark)
@@ -3019,12 +3185,16 @@ class HybridAnalyticalPlacer:
                             + 0.5 * current_den * den_scale
                             + 0.5 * current_cong * cong_scale
                         )
-                        stalls += 1
-                    if stalls >= 6:
-                        print("SA soft CD stalled")
+                    if gate_stop:
+                        print(
+                            f"SA soft CD stalled "
+                            f"(window gate, best={progress_gate.best:.4f}, "
+                            f"patience={progress_gate.patience}/{progress_gate.max_patience})"
+                        )
+                        stop_cd = True
                         break
 
-            if stalls >= 6:
+            if stop_cd or stalls >= 6:
                 break
             print(
                 f"  soft_cd sweep={sweeps} sweep_accepts={sweep_accepts} "
@@ -3032,8 +3202,49 @@ class HybridAnalyticalPlacer:
                 f"best={best_proxy:.4f} [{time()-t0:.0f}s]"
             )
             if sweep_accepts == 0:
+                if accepts > last_checkpoint_accepts:
+                    _set_placement(plc, cd_placement.detach(), benchmark)
+                    metrics = compute_proxy_cost(cd_placement.detach(), benchmark, plc)
+                    proxy = metrics["proxy_cost"]
+                    print(
+                        f"  soft_cd no_move_chk accepts={accepts} evals={evals} "
+                        f"proxy={proxy:.4f} best={best_proxy:.4f} [{time()-t0:.0f}s]"
+                    )
+                    last_checkpoint_accepts = accepts
+                    den_scale = metrics["density_cost"] / (current_den + 1e-8)
+                    cong_scale = metrics["congestion_cost"] / (current_cong + 1e-8)
+                    current_proxy = (
+                        total_wl
+                        + 0.5 * current_den * den_scale
+                        + 0.5 * current_cong * cong_scale
+                    )
+                    _, gate_stop = progress_gate.update(proxy, time() - t0)
+                    if proxy < best_proxy:
+                        best_proxy = proxy
+                        best_placement = cd_placement.clone()
+                        stalls = 0
+                        if (
+                            extension_anchor - best_proxy >= extension_gain
+                            and extension_budget > 0.0
+                            and active_budget < max_budget - 1e-6
+                        ):
+                            old_budget = active_budget
+                            active_budget = min(max_budget, active_budget + extension_budget)
+                            extension_anchor = best_proxy
+                            print(
+                                f"  soft_cd extend: {old_budget:.0f}s->{active_budget:.0f}s "
+                                f"best={best_proxy:.4f} [{time()-t0:.0f}s]"
+                            )
+                        continue
+                    if gate_stop:
+                        print(
+                            f"SA soft CD stalled "
+                            f"(window gate, best={progress_gate.best:.4f}, "
+                            f"patience={progress_gate.patience}/{progress_gate.max_patience})"
+                        )
+                        break
                 stalls += 1
-                if stalls >= 2:
+                if stalls >= 4:
                     print("SA soft CD: no sweep improvements, stopping")
                     break
 
@@ -3052,6 +3263,359 @@ class HybridAnalyticalPlacer:
         print(
             f"SA soft CD done: sweeps={sweeps} accepts={accepts} "
             f"evals={evals} best proxy={best_proxy:.4f}"
+        )
+        return best_placement
+
+    def _soft_hot_untwist_refine(
+        self,
+        placement,
+        benchmark,
+        plc,
+        net_indices,
+        net_mask,
+        net_weights,
+        canvas_norm,
+        num_hard,
+        num_all,
+        fixed,
+        budget=180,
+    ):
+        """
+        Reorder soft macros inside hot congestion neighborhoods.
+
+        The move keeps the neighborhood's existing soft-macro coordinates as
+        "slots" and only permutes which soft macro occupies each slot. That
+        makes it a topology untangler rather than another spreading force:
+        density changes only because soft sizes differ, hard legality is
+        untouched, and every accepted move is guarded by the real proxy.
+        """
+        num_soft = num_all - num_hard
+        if num_soft < 4 or plc is None:
+            return placement
+
+        cur = placement.clone()
+        pos = cur.detach().numpy().astype(np.float32).copy()
+        _, macro_to_nets, _net_hpwl, _eval_delta, _total_wl = self._build_incremental_wl(
+            net_indices, net_mask, net_weights, cur, num_all, canvas_norm
+        )
+        soft_candidates = np.array(
+            [
+                i for i in range(num_hard, num_all)
+                if (not fixed[i].item()) and len(macro_to_nets[i]) > 0
+            ],
+            dtype=np.int32,
+        )
+        if soft_candidates.size < 4:
+            return placement
+
+        ni_np = net_indices.numpy().copy()
+        nm_np = net_mask.numpy().copy()
+        nw_np = net_weights.numpy().copy()
+        num_nets = ni_np.shape[0]
+        max_degree = ni_np.shape[1]
+        sizes_np = benchmark.macro_sizes[:num_all].numpy().copy()
+        bl = self._bin_left.numpy().copy()
+        br = self._bin_right.numpy().copy()
+        bb = self._bin_bottom.numpy().copy()
+        bt = self._bin_top.numpy().copy()
+        bin_w = float(self._bin_w)
+        bin_h = float(self._bin_h)
+        bin_area = bin_w * bin_h
+        n_rows = benchmark.grid_rows
+        n_cols = benchmark.grid_cols
+        hcap = max(1e-6, bin_h * float(getattr(benchmark, "hroutes_per_micron", 1.0) or 1.0))
+        vcap = max(1e-6, bin_w * float(getattr(benchmark, "vroutes_per_micron", 1.0) or 1.0))
+        try:
+            smooth_range = int(plc.get_congestion_smooth_range())
+        except Exception:
+            smooth_range = int(getattr(plc, "smooth_range", 2) or 2)
+        smooth_range = max(0, smooth_range)
+        try:
+            h_alloc, v_alloc = plc.get_macro_routing_allocation()
+        except Exception:
+            h_alloc = float(getattr(plc, "hrouting_alloc", 0.0) or 0.0)
+            v_alloc = float(getattr(plc, "vrouting_alloc", 0.0) or 0.0)
+        h_alloc = float(h_alloc)
+        v_alloc = float(v_alloc)
+
+        _pin_tensors = build_pin_route_tensors(benchmark)
+        _use_pin_routing = _pin_tensors is not None
+        if _use_pin_routing:
+            pin_owner_p, pin_mask_p, pin_xoff_p, pin_yoff_p, pin_fx_p, pin_fy_p, nw_p = _pin_tensors
+            num_pin_nets = pin_owner_p.shape[0]
+        else:
+            pin_owner_p = pin_mask_p = pin_xoff_p = pin_yoff_p = pin_fx_p = pin_fy_p = nw_p = None
+            num_pin_nets = 0
+
+        def build_fast_state(pos_np):
+            density_grid = np.zeros((n_rows, n_cols), dtype=np.float32)
+            _build_density_grid(
+                density_grid, pos_np, sizes_np, num_all, bl, br, bb, bt,
+                bin_area, n_rows, n_cols, bin_w, bin_h,
+            )
+            h_route_grid = np.zeros((n_rows, n_cols), dtype=np.float32)
+            v_route_grid = np.zeros((n_rows, n_cols), dtype=np.float32)
+            if _use_pin_routing:
+                _build_pin_hv_route_grid(
+                    h_route_grid, v_route_grid,
+                    pin_owner_p, pin_mask_p, pin_xoff_p, pin_yoff_p, pin_fx_p, pin_fy_p, nw_p,
+                    pos_np, num_pin_nets, bin_w, bin_h, n_rows, n_cols, hcap, vcap,
+                )
+            else:
+                _build_hv_route_grid(
+                    h_route_grid, v_route_grid, ni_np, nm_np, nw_np, pos_np, num_nets,
+                    bin_w, bin_h, n_rows, n_cols, hcap, vcap,
+                )
+            h_macro_grid = np.zeros((n_rows, n_cols), dtype=np.float32)
+            v_macro_grid = np.zeros((n_rows, n_cols), dtype=np.float32)
+            _build_macro_route_grid(
+                h_macro_grid, v_macro_grid, pos_np, sizes_np, num_hard, bl, br, bb, bt,
+                n_rows, n_cols, bin_w, bin_h, hcap, vcap, h_alloc, v_alloc,
+            )
+            cong_tracker = SmoothHVCostTracker(
+                h_route_grid, v_route_grid, h_macro_grid, v_macro_grid, smooth_range
+            )
+            hpwl = _hpwl_batch(
+                np.arange(num_nets, dtype=np.int32), ni_np, nm_np, pos_np
+            )
+            wl = float((hpwl * nw_np).sum()) / (num_nets * canvas_norm)
+            den = _density_cost_top5(density_grid)
+            cong = cong_tracker.cost()
+            pressure = np.maximum(
+                cong_tracker.v_smooth + v_macro_grid,
+                cong_tracker.h_smooth + h_macro_grid,
+            )
+            pressure = pressure + 0.25 * density_grid
+            return wl, den, cong, pressure
+
+        wl0, den0, cong0, pressure0 = build_fast_state(pos)
+        _set_placement(plc, cur.detach(), benchmark)
+        metrics0 = compute_proxy_cost(cur.detach(), benchmark, plc)
+        best_proxy = float(metrics0["proxy_cost"])
+        den_scale = float(metrics0["density_cost"]) / (den0 + 1e-8)
+        cong_scale = float(metrics0["congestion_cost"]) / (cong0 + 1e-8)
+
+        def fast_proxy_for(pos_np):
+            wl, den, cong, pressure = build_fast_state(pos_np)
+            proxy = wl + 0.5 * den * den_scale + 0.5 * cong * cong_scale
+            return proxy, wl, den, cong, pressure
+
+        current_fast = wl0 + 0.5 * den0 * den_scale + 0.5 * cong0 * cong_scale
+        best_placement = cur.clone()
+        best_pos = pos.copy()
+        print(
+            f"Soft untwist start: proxy={best_proxy:.4f} fast={current_fast:.4f} "
+            f"wl={wl0:.4f} den={metrics0['density_cost']:.4f} "
+            f"cong={metrics0['congestion_cost']:.4f} candidates={soft_candidates.size}"
+        )
+
+        def external_barycenters(group, pos_np):
+            group_set = {int(i) for i in group}
+            out = np.zeros((len(group), 2), dtype=np.float32)
+            for gi, i_raw in enumerate(group):
+                i = int(i_raw)
+                sx = sy = sw = 0.0
+                fallback_sx = fallback_sy = fallback_sw = 0.0
+                for n in macro_to_nets[i]:
+                    w = float(nw_np[n])
+                    for d in range(max_degree):
+                        if not nm_np[n, d]:
+                            break
+                        j = int(ni_np[n, d])
+                        if j == i:
+                            continue
+                        fallback_sx += float(pos_np[j, 0]) * w
+                        fallback_sy += float(pos_np[j, 1]) * w
+                        fallback_sw += w
+                        if j not in group_set:
+                            sx += float(pos_np[j, 0]) * w
+                            sy += float(pos_np[j, 1]) * w
+                            sw += w
+                if sw <= 1e-9:
+                    sx, sy, sw = fallback_sx, fallback_sy, fallback_sw
+                if sw <= 1e-9:
+                    out[gi] = pos_np[i]
+                else:
+                    out[gi, 0] = sx / sw
+                    out[gi, 1] = sy / sw
+            return out
+
+        def make_groups(pos_np, pressure):
+            rows = np.clip((pos_np[soft_candidates, 1] / bin_h).astype(np.int64), 0, n_rows - 1)
+            cols = np.clip((pos_np[soft_candidates, 0] / bin_w).astype(np.int64), 0, n_cols - 1)
+            hot = pressure[rows, cols]
+            degree = np.array([len(macro_to_nets[int(i)]) for i in soft_candidates], dtype=np.float32)
+            score = hot + 0.006 * np.sqrt(np.maximum(degree, 1.0))
+            seed_n = min(28, soft_candidates.size)
+            seed_idx = np.argpartition(score, -seed_n)[-seed_n:]
+            seed_idx = seed_idx[np.argsort(-score[seed_idx])]
+            groups = []
+            seen = set()
+            min_group = min(6, soft_candidates.size)
+            max_group = min(24, soft_candidates.size)
+            for si in seed_idx:
+                seed = int(soft_candidates[int(si)])
+                dx = pos_np[soft_candidates, 0] - pos_np[seed, 0]
+                dy = pos_np[soft_candidates, 1] - pos_np[seed, 1]
+                dist = np.sqrt(dx * dx + dy * dy)
+                pool_n = min(soft_candidates.size, max(max_group * 4, min_group))
+                pool_idx = np.argpartition(dist, pool_n - 1)[:pool_n]
+                pool_scores = score[pool_idx] / (float(score[pool_idx].max()) + 1e-8)
+                rank = dist[pool_idx] / (canvas_norm + 1e-8) - 0.015 * pool_scores
+                k = min(max_group, max(min_group, int(10 + 0.18 * pool_n)))
+                chosen_idx = pool_idx[np.argsort(rank)[:k]]
+                group = np.unique(soft_candidates[chosen_idx]).astype(np.int32)
+                if group.size < 4:
+                    continue
+                key = tuple(sorted(int(x) for x in group[: min(group.size, 16)]))
+                if key in seen:
+                    continue
+                seen.add(key)
+                groups.append(group)
+                if len(groups) >= 14:
+                    break
+            return groups
+
+        def candidate_targets(group, pos_np):
+            slots = pos_np[group].copy()
+            bary = external_barycenters(group, pos_np)
+            center_slots = slots.mean(axis=0)
+            center_bary = bary.mean(axis=0)
+            candidates = []
+            axes = (
+                np.array([1.0, 0.0], dtype=np.float32),
+                np.array([0.0, 1.0], dtype=np.float32),
+                np.array([1.0, 1.0], dtype=np.float32),
+                np.array([1.0, -1.0], dtype=np.float32),
+            )
+            for axis in axes:
+                axis = axis / (np.linalg.norm(axis) + 1e-8)
+                macro_order = np.argsort(bary @ axis)
+                slot_order = np.argsort(slots @ axis)
+                targets = slots.copy()
+                for rank, macro_local in enumerate(macro_order):
+                    targets[int(macro_local)] = slots[int(slot_order[rank])]
+                candidates.append(("axis", targets))
+
+            macro_angles = np.arctan2(bary[:, 1] - center_bary[1], bary[:, 0] - center_bary[0])
+            slot_angles = np.arctan2(slots[:, 1] - center_slots[1], slots[:, 0] - center_slots[0])
+            macro_order = np.argsort(macro_angles)
+            slot_order = np.argsort(slot_angles)
+            targets = slots.copy()
+            for rank, macro_local in enumerate(macro_order):
+                targets[int(macro_local)] = slots[int(slot_order[rank])]
+            candidates.append(("angle", targets))
+
+            # A mild radial variant catches spoke-wheel groups where angular
+            # order is right but near/far ordering is inverted.
+            macro_rad = np.linalg.norm(bary - center_bary, axis=1)
+            slot_rad = np.linalg.norm(slots - center_slots, axis=1)
+            macro_order = np.argsort(macro_rad)
+            slot_order = np.argsort(slot_rad)
+            targets = slots.copy()
+            for rank, macro_local in enumerate(macro_order):
+                targets[int(macro_local)] = slots[int(slot_order[rank])]
+            candidates.append(("radial", targets))
+
+            deduped = []
+            seen = set()
+            original_key = tuple(np.round(slots.reshape(-1), 4))
+            for label, targets in candidates:
+                key = tuple(np.round(targets.reshape(-1), 4))
+                if key == original_key or key in seen:
+                    continue
+                if float(np.max(np.abs(targets - slots))) < 1e-5:
+                    continue
+                seen.add(key)
+                deduped.append((label, targets))
+            return deduped
+
+        t0 = time()
+        passes = 0
+        fast_evals = 0
+        real_evals = 1
+        accepts = 0
+        real_eval_cap = max(6, min(28, int(max(1.0, budget) // 7)))
+
+        while time() - t0 < budget and passes < 3 and real_evals < real_eval_cap:
+            passes += 1
+            current_fast, _wl, current_den_est, current_cong_est, pressure = fast_proxy_for(best_pos)
+            groups = make_groups(best_pos, pressure)
+            if not groups:
+                break
+
+            proposals = []
+            for group in groups:
+                for label, targets in candidate_targets(group, best_pos):
+                    if time() - t0 > budget:
+                        break
+                    cand_pos = best_pos.copy()
+                    cand_pos[group] = targets
+                    fast_proxy, wl, den, cong, _pressure = fast_proxy_for(cand_pos)
+                    fast_evals += 1
+                    fast_delta = fast_proxy - current_fast
+                    den_drop = max(0.0, current_den_est - den)
+                    cong_drop = max(0.0, current_cong_est - cong)
+                    # The fast proxy is still a calibrated approximation; for
+                    # pure slot reorders it can reject the exact moves we want.
+                    # Probe mildly uphill candidates if they relieve hot-route
+                    # pressure, but keep the real-eval cap small.
+                    fast_allow = max(0.020, 0.015 * max(1.0, current_fast))
+                    if fast_delta <= fast_allow or cong_drop > 0.004 or den_drop > 0.004:
+                        selection_score = (
+                            fast_proxy
+                            - 0.15 * cong_drop * cong_scale
+                            - 0.04 * den_drop * den_scale
+                        )
+                        proposals.append((
+                            selection_score, fast_proxy, label, group.copy(),
+                            targets.copy(), wl, den, cong,
+                        ))
+                if time() - t0 > budget:
+                    break
+
+            if not proposals:
+                print(
+                    f"  untwist pass={passes} no plausible reorder "
+                    f"groups={len(groups)} fast_evals={fast_evals} [{time()-t0:.0f}s]"
+                )
+                break
+
+            proposals.sort(key=lambda x: x[0])
+            accepted_this_pass = False
+            probe_n = min(len(proposals), max(4, min(12, int(max(1.0, budget) // 20))))
+            for _score, fast_proxy, label, group, targets, wl, den, cong in proposals[:probe_n]:
+                if time() - t0 > budget or real_evals >= real_eval_cap:
+                    break
+                cand = best_placement.clone()
+                group_t = torch.as_tensor(group, dtype=torch.long, device=cand.device)
+                cand[group_t] = torch.from_numpy(targets).to(dtype=cand.dtype, device=cand.device)
+                _set_placement(plc, cand.detach(), benchmark)
+                metrics = compute_proxy_cost(cand.detach(), benchmark, plc)
+                real_evals += 1
+                proxy = float(metrics["proxy_cost"])
+                print(
+                    f"  untwist pass={passes} {label:<6} size={group.size:2d} "
+                    f"fast={fast_proxy:.4f} proxy={proxy:.4f} best={best_proxy:.4f} "
+                    f"den={metrics['density_cost']:.4f} cong={metrics['congestion_cost']:.4f} "
+                    f"[{time()-t0:.0f}s]"
+                )
+                if proxy < best_proxy - 1e-4:
+                    best_proxy = proxy
+                    best_placement = cand.clone()
+                    best_pos = best_placement.detach().numpy().astype(np.float32).copy()
+                    den_scale = float(metrics["density_cost"]) / (den + 1e-8)
+                    cong_scale = float(metrics["congestion_cost"]) / (cong + 1e-8)
+                    accepts += 1
+                    accepted_this_pass = True
+                    break
+
+            if not accepted_this_pass:
+                break
+
+        print(
+            f"Soft untwist done: passes={passes} accepts={accepts} "
+            f"fast_evals={fast_evals} real_evals={real_evals} best proxy={best_proxy:.4f}"
         )
         return best_placement
 
@@ -3597,8 +4161,13 @@ class HybridAnalyticalPlacer:
         check_interval = 500_000
         last_check_accepts = 0
         min_rate = 5e-5
-        meaningful_gain = 1e-3
-        progress_anchor = best_proxy
+        progress_gate = WindowProgressGate(
+            window=5,
+            patience_windows=3,
+            epsilon=0.0015,
+            min_time=min(300.0, max(0.0, float(budget))),
+            initial_best=best_proxy,
+        )
 
         def rebuild_fast_state(from_tensor):
             nonlocal sa_placement, sa_pos, net_hpwl, total_wl
@@ -3750,20 +4319,11 @@ class HybridAnalyticalPlacer:
                         + 0.5 * current_den * den_scale
                         + 0.5 * current_cong * cong_scale
                     )
+                    _, gate_stop = progress_gate.update(proxy, time() - t0)
                     if proxy < best_proxy:
                         best_proxy = proxy
                         best_placement = sa_placement.clone()
-                        if progress_anchor - best_proxy >= meaningful_gain:
-                            progress_anchor = best_proxy
-                            stalls = 0
-                        else:
-                            stalls += 1
-                            if stalls >= 8:
-                                print(
-                                    f"SA soft displace stalled "
-                                    f"(<{meaningful_gain:.4f} gain over recent checkpoints)"
-                                )
-                                break
+                        stalls = 0
                     else:
                         rebuild_fast_state(best_placement)
                         _set_placement(plc, sa_placement.detach(), benchmark)
@@ -3776,9 +4336,13 @@ class HybridAnalyticalPlacer:
                             + 0.5 * current_cong * cong_scale
                         )
                         stalls += 1
-                        if stalls >= 8:
-                            print("SA soft displace stalled")
-                            break
+                    if gate_stop:
+                        print(
+                            f"SA soft displace stalled "
+                            f"(window gate, best={progress_gate.best:.4f}, "
+                            f"patience={progress_gate.patience}/{progress_gate.max_patience})"
+                        )
+                        break
             else:
                 sa_pos[i, 0] = old_x
                 sa_pos[i, 1] = old_y

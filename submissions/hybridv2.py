@@ -55,6 +55,7 @@ _update_density_incr = _parent_mod._update_density_incr
 _density_cost_top5 = _parent_mod._density_cost_top5
 _hpwl_batch = _parent_mod._hpwl_batch
 ProgressGate = _parent_mod.ProgressGate
+WindowProgressGate = _parent_mod.WindowProgressGate
 # Pin-level routing helpers (TILOS-faithful — closes cong calibration drift).
 _build_pin_hv_route_grid = _parent_mod._build_pin_hv_route_grid
 _update_pin_hv_route_incr_single = _parent_mod._update_pin_hv_route_incr_single
@@ -480,6 +481,7 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
         # 'random':   uniform random, then legalize
         init_strategy: str = "ibm",
         init_perturb_sigma: float = 0.05,  # used when init_strategy='perturbed'
+        enable_soft_untwist: bool = False,
         # ── DAS-MP dataflow weighting ──
         das_enable: bool = True,
         das_indirect_alpha: float = 0.5,
@@ -491,7 +493,7 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
         ch_max_stale_sweeps: int = 3,
         ch_max_stale_checkpoints: int = 3,
         ch_checkpoint_accepts: int = 24,
-        ch_checkpoint_seconds: float = 45.0,
+        ch_checkpoint_seconds: float = 30.0,
         ch_trial_cap: int = 24,
         # ── Soft channel relocate ──
         # Same algorithm as hard channel relocate, but operating on
@@ -556,6 +558,7 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
             soft_macro_lr=soft_macro_lr,
             verbose=verbose,
             enable_plots=enable_plots,
+            enable_soft_untwist=enable_soft_untwist,
         )
         self.das_enable = das_enable
         self.das_indirect_alpha = das_indirect_alpha
@@ -1093,11 +1096,15 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
         score_grid = make_pressure_score()
         span = benchmark.canvas_width + benchmark.canvas_height
         stop_reason = "budget"
-        # ProgressGate: adaptive momentum-based early stop. Improvements
-        # build patience; non-improvements drain it. Replaces the fixed
-        # stale_checkpoints counter with a self-tuning version.
-        gate = ProgressGate(base_patience=4, bonus_per_gain=2, max_patience=12)
-        gate.best = best_proxy
+        # Windowed gate: raw checkpoints bounce, so stop only after whole
+        # windows fail to improve the best real proxy.
+        gate = WindowProgressGate(
+            window=3,
+            patience_windows=1,
+            epsilon=0.001,
+            min_time=min(45.0, max(0.0, float(budget))),
+            initial_best=best_proxy,
+        )
 
         while (
             time() - t0 < budget
@@ -1287,7 +1294,7 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
                             )
                         checkpoint_accepts = 0
                         last_checkpoint_t = time()
-                        improved, should_stop = gate.update(real_proxy)
+                        improved, should_stop = gate.update(real_proxy, time() - t0)
                         if improved:
                             best_proxy = real_proxy
                             best = cur.clone()
