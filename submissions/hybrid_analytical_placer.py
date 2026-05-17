@@ -2848,7 +2848,8 @@ class HybridAnalyticalPlacer:
             mode_reason = f"env:{mode_override}"
         else:
             use_proxy_swap = (
-                (
+                (initial_cong >= 2.10 and initial_density >= 0.836)
+                or (
                     initial_density < 0.836
                     and (290 <= num_hard < 700 or initial_cong > 2.30)
                 )
