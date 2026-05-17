@@ -482,6 +482,7 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
         init_strategy: str = "ibm",
         init_perturb_sigma: float = 0.05,  # used when init_strategy='perturbed'
         enable_soft_untwist: bool = False,
+        enable_net_shear: bool = False,
         # ── DAS-MP dataflow weighting ──
         das_enable: bool = True,
         das_indirect_alpha: float = 0.5,
@@ -559,6 +560,7 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
             verbose=verbose,
             enable_plots=enable_plots,
             enable_soft_untwist=enable_soft_untwist,
+            enable_net_shear=enable_net_shear,
         )
         self.das_enable = das_enable
         self.das_indirect_alpha = das_indirect_alpha
@@ -947,7 +949,7 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
 
         if self.verbose:
             print(
-                f"Channel relocate start: proxy={best_proxy:.4f} "
+                f"Hard channel start: proxy={best_proxy:.4f} "
                 f"wl={best_metrics['wirelength_cost']:.4f} "
                 f"den={best_metrics['density_cost']:.4f} "
                 f"cong={best_metrics['congestion_cost']:.4f} "
@@ -1318,7 +1320,7 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
                             if should_stop:
                                 stop_reason = f"progress_gate (best={gate.best:.4f})"
                                 if self.verbose:
-                                    print("Channel relocate stalled (progress gate)")
+                                    print("Hard channel stalled (progress gate)")
                                 break
 
             if moved_this_sweep == 0:
@@ -1349,7 +1351,7 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
 
         if self.verbose:
             print(
-                f"Channel relocate done: accepts={accepts} fast_evals={fast_evals} "
+                f"Hard channel done: accepts={accepts} fast_evals={fast_evals} "
                 f"real_evals={real_evals} best proxy={best_proxy:.4f} stop={stop_reason}"
             )
         return best
@@ -1582,7 +1584,7 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
 
         if self.verbose:
             print(
-                f"Soft channel relocate start: proxy={best_proxy:.4f} "
+                f"Soft channel start: proxy={best_proxy:.4f} "
                 f"wl={best_metrics['wirelength_cost']:.4f} "
                 f"den={best_metrics['density_cost']:.4f} "
                 f"cong={best_metrics['congestion_cost']:.4f} "
@@ -1913,7 +1915,7 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
                             if should_stop:
                                 stop_reason = f"progress_gate(best={gate.best:.4f})"
                                 if self.verbose:
-                                    print("Soft channel relocate stalled (progress gate)")
+                                    print("Soft channel stalled (progress gate)")
                                 break
 
             if moved_this_sweep == 0:
@@ -1943,7 +1945,7 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
 
         if self.verbose:
             print(
-                f"Soft channel relocate done: accepts={accepts} fast_evals={fast_evals} "
+                f"Soft channel done: accepts={accepts} fast_evals={fast_evals} "
                 f"real_evals={real_evals} best proxy={best_proxy:.4f} stop={stop_reason}"
             )
         return best
@@ -2262,7 +2264,7 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
             net_indices, net_mask, net_weights, canvas_norm,
             budget=self.ch_budget,
         )
-        self._save_v2_stage(plc, benchmark, refined, "08_channel")
+        self._save_v2_stage(plc, benchmark, refined, "10_hard_channel")
 
         # Soft channel relocate is opt-in. It measured as a tiny gain on
         # only two IBM benches, so default runs skip it.
@@ -2273,7 +2275,7 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
                 net_indices, net_mask, net_weights, canvas_norm,
                 budget=self.sch_budget,
             )
-            self._save_v2_stage(plc, benchmark, soft_relocated, "09_soft_channel")
+            self._save_v2_stage(plc, benchmark, soft_relocated, "11_soft_channel")
 
         # Post-channel polish is opt-in. The current incremental-real-eval
         # logs show it consistently restores the incoming checkpoint, so the
@@ -2284,7 +2286,7 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
                 soft_relocated, benchmark, plc, nets,
                 net_indices, net_mask, net_weights, canvas_norm,
             )
-            self._save_v2_stage(plc, benchmark, polished, "10_polish")
+            self._save_v2_stage(plc, benchmark, polished, "12_polish")
 
         # Safety: ensure no overlaps slipped through either stage.
         if self._hard_overlap_count(polished, benchmark) > 0:
