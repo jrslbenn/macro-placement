@@ -3491,10 +3491,16 @@ class HybridAnalyticalPlacer:
         def local_pressure_grid():
             return density_grid + 0.5 * (cong_tracker.h_smooth + cong_tracker.v_smooth)
 
+        def route_pressure_grids():
+            h_total = cong_tracker.h_smooth + h_macro_grid
+            v_total = cong_tracker.v_smooth + v_macro_grid
+            return h_total, v_total, np.maximum(h_total, v_total)
+
         def soft_order():
             rows = np.clip((cd_pos[soft_candidates, 1] / bin_h).astype(np.int64), 0, n_rows - 1)
             cols = np.clip((cd_pos[soft_candidates, 0] / bin_w).astype(np.int64), 0, n_cols - 1)
-            pressure = local_pressure_grid()[rows, cols]
+            h_total, v_total, route_pressure = route_pressure_grids()
+            pressure = local_pressure_grid()[rows, cols] + 0.35 * route_pressure[rows, cols]
             degree = np.array([len(macro_to_nets[int(i)]) for i in soft_candidates], dtype=np.float32)
             score = pressure + 0.01 * np.sqrt(degree) + 0.002 * np.random.random(size=pressure.shape)
             visit_n = min(soft_candidates.size, 320)
@@ -3526,6 +3532,51 @@ class HybridAnalyticalPlacer:
             if gnorm > 1e-8:
                 out.append((x - step_scale * gx / gnorm, y - step_scale * gy / gnorm))
                 out.append((x - 0.5 * step_scale * gx / gnorm, y - 0.5 * step_scale * gy / gnorm))
+
+            # Congestion-specific candidates: if this macro is sitting on a hot
+            # horizontal/vertical route stripe, try moving perpendicular to that
+            # stripe into nearby cooler rows/columns while staying biased toward
+            # the macro's net barycenter. This is a gentler version of net shear:
+            # single-macro moves, real-proxy guarded by the existing CD loop.
+            h_total, v_total, _route_pressure = route_pressure_grids()
+            h_here = float(h_total[r, c])
+            v_here = float(v_total[r, c])
+            h_thresh = float(h_total.mean() + 0.25 * h_total.std())
+            v_thresh = float(v_total.mean() + 0.25 * v_total.std())
+            x_pull = x + 0.45 * (bx - x)
+            y_pull = y + 0.45 * (by - y)
+
+            if h_here >= h_thresh and n_rows > 2:
+                radius = max(2, min(n_rows - 1, int(math.ceil(2.5 * step_scale / max(bin_h, 1e-8)))))
+                r0h = max(0, r - radius)
+                r1h = min(n_rows - 1, r + radius)
+                c0h = max(0, c - 1)
+                c1h = min(n_cols - 1, c + 1)
+                row_pressure = h_total[r0h : r1h + 1, c0h : c1h + 1].mean(axis=1)
+                low_n = min(3, row_pressure.size)
+                if low_n > 0:
+                    low_rows = np.argpartition(row_pressure, low_n - 1)[:low_n]
+                    for rr_local in low_rows:
+                        rr = r0h + int(rr_local)
+                        yy = (rr + 0.5) * bin_h
+                        out.append((x, yy))
+                        out.append((x_pull, yy))
+
+            if v_here >= v_thresh and n_cols > 2:
+                radius = max(2, min(n_cols - 1, int(math.ceil(2.5 * step_scale / max(bin_w, 1e-8)))))
+                c0v = max(0, c - radius)
+                c1v = min(n_cols - 1, c + radius)
+                r0v = max(0, r - 1)
+                r1v = min(n_rows - 1, r + 1)
+                col_pressure = v_total[r0v : r1v + 1, c0v : c1v + 1].mean(axis=0)
+                low_n = min(3, col_pressure.size)
+                if low_n > 0:
+                    low_cols = np.argpartition(col_pressure, low_n - 1)[:low_n]
+                    for cc_local in low_cols:
+                        cc = c0v + int(cc_local)
+                        xx = (cc + 0.5) * bin_w
+                        out.append((xx, y))
+                        out.append((xx, y_pull))
 
             win = max(step_scale * 1.5, max(bin_w, bin_h) * 2.0)
             c0 = max(0, int((x - win) / bin_w))
