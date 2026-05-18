@@ -481,6 +481,10 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
         # 'random':   uniform random, then legalize
         init_strategy: str = "ibm",
         init_perturb_sigma: float = 0.05,  # used when init_strategy='perturbed'
+        init_spectral_blend: float = 0.70,
+        init_spectral_flip_x: bool = False,
+        init_spectral_flip_y: bool = False,
+        init_jitter_sigma: float = 0.0,
         enable_soft_untwist: bool = False,
         enable_net_shear: bool = False,
         # ── DAS-MP dataflow weighting ──
@@ -595,11 +599,30 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
         self.ire_debug_validate = ire_debug_validate
         self.init_strategy = init_strategy
         self.init_perturb_sigma = init_perturb_sigma
+        self.init_spectral_blend = init_spectral_blend
+        self.init_spectral_flip_x = init_spectral_flip_x
+        self.init_spectral_flip_y = init_spectral_flip_y
+        self.init_jitter_sigma = init_jitter_sigma
         self._das_benchmark_ref: Benchmark | None = None
         self._cached_nets: List[List[int]] | None = None
         self._cached_net_indices: torch.Tensor | None = None
         self._cached_net_mask: torch.Tensor | None = None
         self._cached_net_weights: torch.Tensor | None = None
+
+        post_nesterov = os.environ.get("HAP_POST_NESTEROV", "").strip().lower()
+        if post_nesterov not in ("", "0", "false", "no", "off"):
+            self.polish_enable = True
+            self.polish_steps = int(os.environ.get("HAP_POST_NESTEROV_STEPS", self.polish_steps))
+            self.polish_hard_tether_frac = float(
+                os.environ.get("HAP_POST_NESTEROV_TETHER", "0.005")
+            )
+            self.polish_hard_lr = float(os.environ.get("HAP_POST_NESTEROV_HARD_LR", "0.08"))
+            self.polish_soft_lr = float(os.environ.get("HAP_POST_NESTEROV_SOFT_LR", "0.08"))
+            print(
+                "[v2] post-refine Nesterov polish enabled "
+                f"steps={self.polish_steps} tether={self.polish_hard_tether_frac:.4f} "
+                f"hard_lr={self.polish_hard_lr:.3f} soft_lr={self.polish_soft_lr:.3f}"
+            )
 
     # ────────────────────────────────────────────────────────────────
     # DAS-MP dataflow-aware net weighting
@@ -2196,13 +2219,24 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
         canvas_w = benchmark.canvas_width
         canvas_h = benchmark.canvas_height
         gen = torch.Generator().manual_seed(self.seed)
+        torch.manual_seed(self.seed)
+        movable_all = ~benchmark.macro_fixed
 
         if self.init_strategy == "spectral":
             from submissions.hybrid_analytical_placer import spectral_init_placement
             nets_list = [net.tolist() for net in benchmark.net_nodes if len(net) >= 2]
             bench.macro_positions = spectral_init_placement(
-                bench.macro_positions, benchmark, nets_list, blend=0.7,
+                bench.macro_positions, benchmark, nets_list,
+                blend=self.init_spectral_blend,
             )
+            if self.init_spectral_flip_x:
+                bench.macro_positions[movable_all, 0] = (
+                    canvas_w - bench.macro_positions[movable_all, 0]
+                )
+            if self.init_spectral_flip_y:
+                bench.macro_positions[movable_all, 1] = (
+                    canvas_h - bench.macro_positions[movable_all, 1]
+                )
         elif self.init_strategy == "perturbed":
             sigma_x = self.init_perturb_sigma * canvas_w
             sigma_y = self.init_perturb_sigma * canvas_h
@@ -2210,6 +2244,25 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
             noise[:, 0].normal_(0.0, sigma_x, generator=gen)
             noise[:, 1].normal_(0.0, sigma_y, generator=gen)
             bench.macro_positions = bench.macro_positions + noise
+        elif self.init_strategy == "halton":
+            def vdc(index: int, base: int) -> float:
+                denom = 1.0
+                value = 0.0
+                while index:
+                    index, rem = divmod(index, base)
+                    denom *= base
+                    value += rem / denom
+                return value
+
+            movable_idx = torch.where(movable_all)[0]
+            area = (sizes[movable_idx, 0] * sizes[movable_idx, 1]).cpu().numpy()
+            order_np = np.argsort(-area)
+            seed_offset = 17 + (self.seed % 1009)
+            for rank, local_i in enumerate(order_np):
+                i = int(movable_idx[int(local_i)])
+                h = seed_offset + rank + 1
+                bench.macro_positions[i, 0] = hw[i] + vdc(h, 2) * max(1e-6, canvas_w - 2 * hw[i])
+                bench.macro_positions[i, 1] = hh[i] + vdc(h, 3) * max(1e-6, canvas_h - 2 * hh[i])
         elif self.init_strategy == "random":
             n = num_all
             bench.macro_positions = torch.empty_like(bench.macro_positions)
@@ -2217,6 +2270,14 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
             bench.macro_positions[:, 1].uniform_(0.0, canvas_h, generator=gen)
         else:
             raise ValueError(f"unknown init_strategy: {self.init_strategy}")
+
+        if self.init_jitter_sigma > 0.0:
+            sigma_x = self.init_jitter_sigma * canvas_w
+            sigma_y = self.init_jitter_sigma * canvas_h
+            jitter = torch.empty_like(bench.macro_positions)
+            jitter[:, 0].normal_(0.0, sigma_x, generator=gen)
+            jitter[:, 1].normal_(0.0, sigma_y, generator=gen)
+            bench.macro_positions[movable_all] += jitter[movable_all]
 
         # Clamp to canvas bounds (per-macro size). Fixed macros stay put.
         bench.macro_positions[:, 0] = torch.clamp(
@@ -2228,7 +2289,16 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
         if benchmark.macro_fixed.any():
             bench.macro_positions[benchmark.macro_fixed] = benchmark.macro_positions[benchmark.macro_fixed]
         if self.verbose:
-            print(f"[init] applied strategy '{self.init_strategy}' (seed={self.seed})")
+            detail = ""
+            if self.init_strategy == "perturbed":
+                detail = f" sigma={self.init_perturb_sigma:.3f}"
+            elif self.init_strategy == "spectral":
+                detail = (
+                    f" blend={self.init_spectral_blend:.2f}"
+                    f" flip=({int(self.init_spectral_flip_x)},{int(self.init_spectral_flip_y)})"
+                    f" jitter={self.init_jitter_sigma:.3f}"
+                )
+            print(f"[init] applied strategy '{self.init_strategy}' (seed={self.seed}{detail})")
         return bench
 
     def place(self, benchmark: Benchmark) -> torch.Tensor:
@@ -2300,7 +2370,7 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
         if not self.enable_plots:
             return
         try:
-            vis_dir = Path("vis") / benchmark.name
+            vis_dir = Path(os.environ.get("HAP_VIS_DIR", "vis")) / benchmark.name
             vis_dir.mkdir(parents=True, exist_ok=True)
             from macro_place.utils import visualize_placement
             _set_placement(plc, placement.detach(), benchmark)

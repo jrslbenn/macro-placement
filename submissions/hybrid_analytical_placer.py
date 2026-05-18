@@ -1257,7 +1257,7 @@ class HybridAnalyticalPlacer:
         self.enable_soft_cd = enable_soft_cd
 
     def place(self, benchmark: Benchmark) -> torch.Tensor:
-        log_dir = Path("logs")
+        log_dir = Path(os.environ.get("HAP_LOG_DIR", "logs"))
         log_dir.mkdir(parents=True, exist_ok=True)
         log_path = log_dir / f"{benchmark.name}.log"
         original_print = builtins.print
@@ -1291,7 +1291,7 @@ class HybridAnalyticalPlacer:
             return placement
 
         plc = self._load_plc_for_logging(benchmark)
-        _vis_dir = Path("vis") / benchmark.name
+        _vis_dir = Path(os.environ.get("HAP_VIS_DIR", "vis")) / benchmark.name
 
         def _save_plot(label: str, pos: torch.Tensor) -> None:
             if not self.enable_plots:
@@ -1368,6 +1368,8 @@ class HybridAnalyticalPlacer:
         K = 3
         recent_proxies = []
         top_k_candidates = []
+        initial_proxy_for_gate = None
+        nesterov_bad_tracks = 0
 
         def sync_plc(step: int) -> None:
             nonlocal plc_synced_at
@@ -1388,6 +1390,7 @@ class HybridAnalyticalPlacer:
             self._initial_proxy_cost = float(initial_metrics["proxy_cost"])
             self._initial_density_cost = float(initial_metrics["density_cost"])
             self._initial_congestion_cost = float(initial_metrics["congestion_cost"])
+            initial_proxy_for_gate = float(initial_metrics["proxy_cost"])
             top_k_candidates.append((initial_proxy, -1, placement.detach().clone()))
 
         start_time = time()
@@ -1395,6 +1398,12 @@ class HybridAnalyticalPlacer:
         hard_time_budget = 3000
         min_stage_budget = 120
         nesterov_time_budget = 300
+        skip_nesterov = os.environ.get("HAP_SKIP_NESTEROV", "").strip().lower() not in (
+            "", "0", "false", "no", "off"
+        )
+        if skip_nesterov:
+            print("Nesterov skipped by HAP_SKIP_NESTEROV=1")
+            nesterov_time_budget = -1.0
         step = 0
         track_proxies = []
         print("starting iters")
@@ -1604,6 +1613,22 @@ class HybridAnalyticalPlacer:
                 top_k_candidates.sort(key=lambda x: x[0])
                 top_k_candidates = top_k_candidates[:K]
                 track_proxies.append(float(proxy_est))
+                if initial_proxy_for_gate is not None:
+                    # Alternate starts can be outright bad. If Nesterov is
+                    # clearly making real proxy worse for consecutive early
+                    # checks, keep the initial checkpoint and move on.
+                    margin = max(0.025, 0.015 * initial_proxy_for_gate)
+                    best_tracked = float(top_k_candidates[0][0]) if top_k_candidates else float(proxy_est)
+                    if float(proxy_est) > initial_proxy_for_gate + margin and best_tracked >= initial_proxy_for_gate - 1e-4:
+                        nesterov_bad_tracks += 1
+                    else:
+                        nesterov_bad_tracks = 0
+                    if nesterov_bad_tracks >= 2:
+                        print(
+                            f"Nesterov worsening early, stopping at step {step} "
+                            f"(start={initial_proxy_for_gate:.4f}, current={float(proxy_est):.4f})"
+                        )
+                        break
                 if len(track_proxies) >= 6 and all(
                     p > track_proxies[-6] for p in track_proxies[-5:]
                 ):
@@ -1710,6 +1735,29 @@ class HybridAnalyticalPlacer:
             f"init_den={policy_initial_density:.4f} init_cong={policy_initial_cong:.4f} "
             f"soft_displace_max={soft_displace_max_budget}s soft_cd_max={soft_cd_max_budget}s"
         )
+        sparse_checkpoints = os.environ.get("HAP_SPARSE_CHECKPOINTS", "1").strip().lower() not in (
+            "", "0", "false", "no", "off"
+        )
+        soft_swap_checkpoint_every = int(
+            os.environ.get("HAP_SOFT_SWAP_CKPT", "800" if sparse_checkpoints else "300")
+        )
+        soft_displace_checkpoint_every = int(
+            os.environ.get("HAP_SOFT_DISPLACE_CKPT", "800" if sparse_checkpoints else "200")
+        )
+        soft_cd_checkpoint_every = int(
+            os.environ.get("HAP_SOFT_CD_CKPT", "180" if sparse_checkpoints else "60")
+        )
+        hard_displace_checkpoint_every = int(
+            os.environ.get("HAP_HARD_DISPLACE_CKPT", "200")
+        )
+        print(
+            "Checkpoint policy: "
+            f"soft_swap={soft_swap_checkpoint_every} "
+            f"soft_displace={soft_displace_checkpoint_every} "
+            f"soft_cd={soft_cd_checkpoint_every} "
+            f"hard_displace={hard_displace_checkpoint_every} "
+            f"sparse={'on' if sparse_checkpoints else 'off'}"
+        )
 
         def stage_budget(label: str, max_budget: float = 180) -> float:
             elapsed = time() - start_time
@@ -1772,7 +1820,7 @@ class HybridAnalyticalPlacer:
                         base_budget=90,
                         extension_budget=60,
                         extension_gain=0.002,
-                        checkpoint_every=300,
+                        checkpoint_every=soft_swap_checkpoint_every,
                     )
                     _save_plot("03_soft_swap", best_valid_placement)
                 else:
@@ -1825,7 +1873,7 @@ class HybridAnalyticalPlacer:
                         num_all,
                         fixed,
                         budget=soft_displace_budget,
-                        checkpoint_every=200,
+                        checkpoint_every=soft_displace_checkpoint_every,
                     )
                     _save_plot("05_soft_displace", best_valid_placement)
                 else:
@@ -1854,7 +1902,7 @@ class HybridAnalyticalPlacer:
                             base_budget=soft_cd_base_budget,
                             extension_budget=soft_cd_extension_budget,
                             extension_gain=2e-3,
-                            checkpoint_every=60,
+                            checkpoint_every=soft_cd_checkpoint_every,
                         )
                         _save_plot("06_soft_cd", best_valid_placement)
                     else:
@@ -1944,6 +1992,37 @@ class HybridAnalyticalPlacer:
                 else:
                     print("Soft LNS disabled")
 
+                escape_enabled = os.environ.get("HAP_ESCAPE_PERTURB", "").strip().lower() not in (
+                    "", "0", "false", "no", "off"
+                )
+                if escape_enabled:
+                    remaining = total_time_budget - (time() - start_time)
+                    escape_max = float(os.environ.get("HAP_ESCAPE_BUDGET", "300"))
+                    escape_budget = stage_budget("Perturb escape", max_budget=escape_max)
+                    print(
+                        f"Perturb escape budget: {escape_budget:.0f}s "
+                        f"(elapsed={time()-start_time:.1f}s remaining={remaining:.1f}s)"
+                    )
+                    if escape_budget > 0:
+                        best_valid_placement = self._soft_perturb_escape(
+                            best_valid_placement,
+                            benchmark,
+                            plc,
+                            net_indices,
+                            net_mask,
+                            net_weights,
+                            canvas_norm,
+                            num_hard,
+                            num_all,
+                            fixed,
+                            budget=escape_budget,
+                        )
+                        _save_plot("07_perturb_escape", best_valid_placement)
+                    else:
+                        print("Perturb escape skipped: no remaining budget")
+                else:
+                    print("Perturb escape disabled")
+
             remaining = total_time_budget - (time() - start_time)
             displace_budget = stage_budget("Hard displace", max_budget=hard_displace_max_budget)
             print(
@@ -1965,7 +2044,7 @@ class HybridAnalyticalPlacer:
                     self._leg_sep_x_base.numpy().copy(),
                     self._leg_sep_y_base.numpy().copy(),
                     budget=displace_budget,
-                    checkpoint_every=200,
+                    checkpoint_every=hard_displace_checkpoint_every,
                 )
                 _save_plot("08_hard_displace", best_valid_placement)
             else:
@@ -2137,6 +2216,10 @@ class HybridAnalyticalPlacer:
                 initial_best=best_proxy,
             )
             max_displacement = canvas_norm * 0.03
+            no_accept_limit = max(
+                100_000,
+                int(os.environ.get("HAP_HARD_NO_ACCEPT_LIMIT", "1000000")),
+            )
 
             for _ in range(100_000_000):
                 if time() - t0 > budget:
@@ -2173,6 +2256,11 @@ class HybridAnalyticalPlacer:
                     continue
 
                 total += 1
+                if total - last_accept_step > no_accept_limit:
+                    print(
+                        f"Hard displace: no accepts in {no_accept_limit} attempts, stopping"
+                    )
+                    break
 
                 old_x = float(sa_pos[i, 0])
                 old_y = float(sa_pos[i, 1])
@@ -2321,8 +2409,10 @@ class HybridAnalyticalPlacer:
                         update_hv_route_incr_single_smooth(h_route_grid, v_route_grid, cong_tracker, ni_np, nm_np, nw_np, sa_pos, aff, i, new_x, new_y, bin_w, bin_h, n_rows, n_cols, hcap, vcap)
                     _update_macro_route_incr_single(h_macro_grid, v_macro_grid, new_x, new_y, old_x, old_y, hw_np[i], hh_np[i], bl, br, bb, bt, n_rows, n_cols, bin_w, bin_h, hcap, vcap, h_alloc, v_alloc)
 
-                if total - last_accept_step > 5_000_000:
-                    print(f"Hard displace: no accepts in 5M attempts, stopping")
+                if total - last_accept_step > no_accept_limit:
+                    print(
+                        f"Hard displace: no accepts in {no_accept_limit} attempts, stopping"
+                    )
                     break
 
             print(f"Hard displace done: {total} attempts, {accepts} accepts, best real_proxy={best_proxy:.4f}")
@@ -2864,6 +2954,18 @@ class HybridAnalyticalPlacer:
             f"hard={num_hard} nets={num_nets} init_den={initial_density:.4f} "
             f"init_cong={initial_cong:.4f} (HV cong, smooth={smooth_range})"
         )
+        timing_enabled = os.environ.get("HAP_STAGE_TIMERS", "").strip().lower() not in (
+            "", "0", "false", "no", "off"
+        )
+        ss_timers = {
+            "proposal": 0.0,
+            "hpwl": 0.0,
+            "density_cong": 0.0,
+            "move_apply": 0.0,
+            "rollback": 0.0,
+            "rebuild": 0.0,
+            "real": 0.0,
+        }
 
         accepts = total = stalls = 0
         last_accept_step = 0
@@ -2881,6 +2983,8 @@ class HybridAnalyticalPlacer:
         def rebuild_fast_state(from_tensor):
             nonlocal sa_placement, sa_pos, net_hpwl, total_wl
             nonlocal current_den, current_cong, current_proxy, cong_tracker
+            if timing_enabled:
+                _timer_t = time()
             sa_placement = from_tensor.clone()
             sa_pos[:] = sa_placement.detach().numpy()
             net_hpwl[:] = _hpwl_batch(np.arange(num_nets, dtype=np.int32), ni_np, nm_np, sa_pos)
@@ -2909,6 +3013,8 @@ class HybridAnalyticalPlacer:
             current_den = _density_cost_top5(density_grid)
             current_cong = cong_tracker.cost()
             current_proxy = total_wl + 0.5 * current_den * den_scale + 0.5 * current_cong * cong_scale
+            if timing_enabled:
+                ss_timers["rebuild"] += time() - _timer_t
 
         def apply_move(idx, old_x, old_y, new_x, new_y):
             sa_pos[idx, 0] = new_x
@@ -2939,8 +3045,12 @@ class HybridAnalyticalPlacer:
             nonlocal best_proxy, best_placement, best_den_real, best_cong_real
             nonlocal den_scale, cong_scale, current_proxy, stalls, extension_anchor
             nonlocal active_budget, last_checkpoint_accepts
+            if timing_enabled:
+                _timer_t = time()
             _set_placement(plc, sa_placement.detach(), benchmark)
             metrics = compute_proxy_cost(sa_placement.detach(), benchmark, plc)
+            if timing_enabled:
+                ss_timers["real"] += time() - _timer_t
             proxy = metrics["proxy_cost"]
             den_scale = metrics["density_cost"] / (current_den + 1e-8)
             cong_scale = metrics["congestion_cost"] / (current_cong + 1e-8)
@@ -3002,6 +3112,8 @@ class HybridAnalyticalPlacer:
                 continue
 
             total += 1
+            if timing_enabled:
+                _timer_t = time()
             old_i_x = float(sa_pos[i, 0])
             old_i_y = float(sa_pos[i, 1])
             old_j_x = float(sa_pos[j, 0])
@@ -3009,14 +3121,29 @@ class HybridAnalyticalPlacer:
 
             aff = np.union1d(macro_to_nets[i], macro_to_nets[j])
             old_vals = net_hpwl[aff].copy()
+            if timing_enabled:
+                ss_timers["proposal"] += time() - _timer_t
 
+            if timing_enabled:
+                _timer_t = time()
             apply_move(i, old_i_x, old_i_y, old_j_x, old_j_y)
             apply_move(j, old_j_x, old_j_y, old_i_x, old_i_y)
+            if timing_enabled:
+                ss_timers["move_apply"] += time() - _timer_t
 
+            if timing_enabled:
+                _timer_t = time()
             new_vals = _hpwl_batch(aff, ni_np, nm_np, sa_pos) if aff.size else old_vals
             delta = float((new_vals - old_vals).sum()) / (num_nets * canvas_norm)
+            if timing_enabled:
+                ss_timers["hpwl"] += time() - _timer_t
+
+            if timing_enabled:
+                _timer_t = time()
             new_den = _density_cost_top5(density_grid)
             new_cong = cong_tracker.cost()
+            if timing_enabled:
+                ss_timers["density_cong"] += time() - _timer_t
             candidate_wl = total_wl + delta
             new_proxy = total_wl + delta + 0.5 * new_den * den_scale + 0.5 * new_cong * cong_scale
 
@@ -3041,8 +3168,12 @@ class HybridAnalyticalPlacer:
                         print("Soft swap stalled")
                         break
             else:
+                if timing_enabled:
+                    _timer_t = time()
                 apply_move(i, old_j_x, old_j_y, old_i_x, old_i_y)
                 apply_move(j, old_i_x, old_i_y, old_j_x, old_j_y)
+                if timing_enabled:
+                    ss_timers["rollback"] += time() - _timer_t
 
             if total - last_accept_step > 2_000_000:
                 print("Soft swap: no accepts in 2M attempts, stopping")
@@ -3053,6 +3184,17 @@ class HybridAnalyticalPlacer:
                 print("Soft swap stalled")
 
         print(f"Soft swap done: {total} attempts, {accepts} accepts, best proxy={best_proxy:.4f}")
+        if timing_enabled:
+            timed_total = max(1e-9, sum(ss_timers.values()))
+            print(
+                "Soft swap timing: "
+                + " ".join(
+                    f"{k}={v:.2f}s({100.0*v/timed_total:.0f}%)"
+                    for k, v in ss_timers.items()
+                    if v > 0.0
+                )
+                + f" timed={timed_total:.2f}s wall={time()-t0:.2f}s"
+            )
         return best_placement
 
     def _soft_spread_refine(
@@ -3409,10 +3551,29 @@ class HybridAnalyticalPlacer:
             f"wl={total_wl:.4f} candidates={soft_candidates.size} "
             f"(HV cong, smooth={smooth_range})"
         )
+        route_aware_soft_cd = os.environ.get("HAP_ROUTE_AWARE_SOFT_CD", "1").strip().lower() not in (
+            "0", "false", "no", "off"
+        )
+        if not route_aware_soft_cd:
+            print("Soft CD route-aware candidates disabled by HAP_ROUTE_AWARE_SOFT_CD=0")
+        timing_enabled = os.environ.get("HAP_STAGE_TIMERS", "").strip().lower() not in (
+            "", "0", "false", "no", "off"
+        )
+        cd_timers = {
+            "order": 0.0,
+            "candidate_gen": 0.0,
+            "hpwl_batch": 0.0,
+            "incr_eval": 0.0,
+            "commit": 0.0,
+            "rebuild": 0.0,
+            "real": 0.0,
+        }
 
         def rebuild_fast_state(from_tensor):
             nonlocal cd_placement, cd_pos, net_hpwl, total_wl
             nonlocal current_den, current_cong, current_proxy, cong_tracker
+            if timing_enabled:
+                _timer_t = time()
             cd_placement = from_tensor.clone()
             cd_pos[:] = cd_placement.detach().numpy()
             net_hpwl[:] = _hpwl_batch(np.arange(num_nets, dtype=np.int32), ni_np, nm_np, cd_pos)
@@ -3445,6 +3606,8 @@ class HybridAnalyticalPlacer:
                 + 0.5 * current_den * den_scale
                 + 0.5 * current_cong * cong_scale
             )
+            if timing_enabled:
+                cd_timers["rebuild"] += time() - _timer_t
 
         def apply_one(i, old_x, old_y, new_x, new_y):
             cd_pos[i, 0] = new_x
@@ -3499,8 +3662,10 @@ class HybridAnalyticalPlacer:
         def soft_order():
             rows = np.clip((cd_pos[soft_candidates, 1] / bin_h).astype(np.int64), 0, n_rows - 1)
             cols = np.clip((cd_pos[soft_candidates, 0] / bin_w).astype(np.int64), 0, n_cols - 1)
-            h_total, v_total, route_pressure = route_pressure_grids()
-            pressure = local_pressure_grid()[rows, cols] + 0.35 * route_pressure[rows, cols]
+            pressure = local_pressure_grid()[rows, cols]
+            if route_aware_soft_cd:
+                h_total, v_total, route_pressure = route_pressure_grids()
+                pressure = pressure + 0.35 * route_pressure[rows, cols]
             degree = np.array([len(macro_to_nets[int(i)]) for i in soft_candidates], dtype=np.float32)
             score = pressure + 0.01 * np.sqrt(degree) + 0.002 * np.random.random(size=pressure.shape)
             visit_n = min(soft_candidates.size, 320)
@@ -3533,50 +3698,51 @@ class HybridAnalyticalPlacer:
                 out.append((x - step_scale * gx / gnorm, y - step_scale * gy / gnorm))
                 out.append((x - 0.5 * step_scale * gx / gnorm, y - 0.5 * step_scale * gy / gnorm))
 
-            # Congestion-specific candidates: if this macro is sitting on a hot
-            # horizontal/vertical route stripe, try moving perpendicular to that
-            # stripe into nearby cooler rows/columns while staying biased toward
-            # the macro's net barycenter. This is a gentler version of net shear:
-            # single-macro moves, real-proxy guarded by the existing CD loop.
-            h_total, v_total, _route_pressure = route_pressure_grids()
-            h_here = float(h_total[r, c])
-            v_here = float(v_total[r, c])
-            h_thresh = float(h_total.mean() + 0.25 * h_total.std())
-            v_thresh = float(v_total.mean() + 0.25 * v_total.std())
-            x_pull = x + 0.45 * (bx - x)
-            y_pull = y + 0.45 * (by - y)
+            if route_aware_soft_cd:
+                # Congestion-specific candidates: if this macro is sitting on a hot
+                # horizontal/vertical route stripe, try moving perpendicular to that
+                # stripe into nearby cooler rows/columns while staying biased toward
+                # the macro's net barycenter. This is a gentler version of net shear:
+                # single-macro moves, real-proxy guarded by the existing CD loop.
+                h_total, v_total, _route_pressure = route_pressure_grids()
+                h_here = float(h_total[r, c])
+                v_here = float(v_total[r, c])
+                h_thresh = float(h_total.mean() + 0.25 * h_total.std())
+                v_thresh = float(v_total.mean() + 0.25 * v_total.std())
+                x_pull = x + 0.45 * (bx - x)
+                y_pull = y + 0.45 * (by - y)
 
-            if h_here >= h_thresh and n_rows > 2:
-                radius = max(2, min(n_rows - 1, int(math.ceil(2.5 * step_scale / max(bin_h, 1e-8)))))
-                r0h = max(0, r - radius)
-                r1h = min(n_rows - 1, r + radius)
-                c0h = max(0, c - 1)
-                c1h = min(n_cols - 1, c + 1)
-                row_pressure = h_total[r0h : r1h + 1, c0h : c1h + 1].mean(axis=1)
-                low_n = min(3, row_pressure.size)
-                if low_n > 0:
-                    low_rows = np.argpartition(row_pressure, low_n - 1)[:low_n]
-                    for rr_local in low_rows:
-                        rr = r0h + int(rr_local)
-                        yy = (rr + 0.5) * bin_h
-                        out.append((x, yy))
-                        out.append((x_pull, yy))
+                if h_here >= h_thresh and n_rows > 2:
+                    radius = max(2, min(n_rows - 1, int(math.ceil(2.5 * step_scale / max(bin_h, 1e-8)))))
+                    r0h = max(0, r - radius)
+                    r1h = min(n_rows - 1, r + radius)
+                    c0h = max(0, c - 1)
+                    c1h = min(n_cols - 1, c + 1)
+                    row_pressure = h_total[r0h : r1h + 1, c0h : c1h + 1].mean(axis=1)
+                    low_n = min(3, row_pressure.size)
+                    if low_n > 0:
+                        low_rows = np.argpartition(row_pressure, low_n - 1)[:low_n]
+                        for rr_local in low_rows:
+                            rr = r0h + int(rr_local)
+                            yy = (rr + 0.5) * bin_h
+                            out.append((x, yy))
+                            out.append((x_pull, yy))
 
-            if v_here >= v_thresh and n_cols > 2:
-                radius = max(2, min(n_cols - 1, int(math.ceil(2.5 * step_scale / max(bin_w, 1e-8)))))
-                c0v = max(0, c - radius)
-                c1v = min(n_cols - 1, c + radius)
-                r0v = max(0, r - 1)
-                r1v = min(n_rows - 1, r + 1)
-                col_pressure = v_total[r0v : r1v + 1, c0v : c1v + 1].mean(axis=0)
-                low_n = min(3, col_pressure.size)
-                if low_n > 0:
-                    low_cols = np.argpartition(col_pressure, low_n - 1)[:low_n]
-                    for cc_local in low_cols:
-                        cc = c0v + int(cc_local)
-                        xx = (cc + 0.5) * bin_w
-                        out.append((xx, y))
-                        out.append((xx, y_pull))
+                if v_here >= v_thresh and n_cols > 2:
+                    radius = max(2, min(n_cols - 1, int(math.ceil(2.5 * step_scale / max(bin_w, 1e-8)))))
+                    c0v = max(0, c - radius)
+                    c1v = min(n_cols - 1, c + radius)
+                    r0v = max(0, r - 1)
+                    r1v = min(n_rows - 1, r + 1)
+                    col_pressure = v_total[r0v : r1v + 1, c0v : c1v + 1].mean(axis=0)
+                    low_n = min(3, col_pressure.size)
+                    if low_n > 0:
+                        low_cols = np.argpartition(col_pressure, low_n - 1)[:low_n]
+                        for cc_local in low_cols:
+                            cc = c0v + int(cc_local)
+                            xx = (cc + 0.5) * bin_w
+                            out.append((xx, y))
+                            out.append((xx, y_pull))
 
             win = max(step_scale * 1.5, max(bin_w, bin_h) * 2.0)
             c0 = max(0, int((x - win) / bin_w))
@@ -3625,7 +3791,11 @@ class HybridAnalyticalPlacer:
         while time() - t0 < active_budget:
             sweeps += 1
             sweep_accepts = 0
+            if timing_enabled:
+                _timer_t = time()
             order = soft_order()
+            if timing_enabled:
+                cd_timers["order"] += time() - _timer_t
             elapsed_frac = min(1.0, (time() - t0) / max(active_budget, 1e-6))
             step_scale = canvas_norm * (0.025 * (1.0 - elapsed_frac) + 0.004 * elapsed_frac)
 
@@ -3648,16 +3818,26 @@ class HybridAnalyticalPlacer:
                 best_move_den = current_den
                 best_move_cong = current_cong
 
+                if timing_enabled:
+                    _timer_t = time()
                 candidates = candidate_positions(i, step_scale)
+                if timing_enabled:
+                    cd_timers["candidate_gen"] += time() - _timer_t
                 if not candidates:
                     continue
+                if timing_enabled:
+                    _timer_t = time()
                 cand_xy = np.asarray(candidates, dtype=np.float32)
                 cand_hpwl = _hpwl_candidate_batch_for_macro(
                     cand_xy[:, 0], cand_xy[:, 1], i, aff, ni_np, nm_np, cd_pos
                 )
+                if timing_enabled:
+                    cd_timers["hpwl_batch"] += time() - _timer_t
 
                 for cand_idx, (new_x, new_y) in enumerate(candidates):
                     evals += 1
+                    if timing_enabled:
+                        _timer_t = time()
                     apply_one(i, old_x, old_y, new_x, new_y)
                     new_hpwl = cand_hpwl[cand_idx]
                     wl_delta = float(((new_hpwl - old_hpwl) * nw_np[aff]).sum()) / (
@@ -3671,6 +3851,8 @@ class HybridAnalyticalPlacer:
                         + 0.5 * new_cong * cong_scale
                     )
                     apply_one(i, new_x, new_y, old_x, old_y)
+                    if timing_enabled:
+                        cd_timers["incr_eval"] += time() - _timer_t
 
                     if cand_proxy < best_move_proxy - 1e-6:
                         best_move = (new_x, new_y)
@@ -3684,6 +3866,8 @@ class HybridAnalyticalPlacer:
                     continue
 
                 new_x, new_y = best_move
+                if timing_enabled:
+                    _timer_t = time()
                 apply_one(i, old_x, old_y, new_x, new_y)
                 cd_placement[i, 0] = new_x
                 cd_placement[i, 1] = new_y
@@ -3694,10 +3878,16 @@ class HybridAnalyticalPlacer:
                 current_proxy = best_move_proxy
                 accepts += 1
                 sweep_accepts += 1
+                if timing_enabled:
+                    cd_timers["commit"] += time() - _timer_t
 
                 if accepts % checkpoint_every == 0:
+                    if timing_enabled:
+                        _timer_t = time()
                     _set_placement(plc, cd_placement.detach(), benchmark)
                     metrics = compute_proxy_cost(cd_placement.detach(), benchmark, plc)
+                    if timing_enabled:
+                        cd_timers["real"] += time() - _timer_t
                     proxy = metrics["proxy_cost"]
                     print(
                         f"  soft_cd sweep={sweeps} accepts={accepts} evals={evals} "
@@ -3732,8 +3922,12 @@ class HybridAnalyticalPlacer:
                             )
                     else:
                         rebuild_fast_state(best_placement)
+                        if timing_enabled:
+                            _timer_t = time()
                         _set_placement(plc, cd_placement.detach(), benchmark)
                         best_metrics = compute_proxy_cost(cd_placement.detach(), benchmark, plc)
+                        if timing_enabled:
+                            cd_timers["real"] += time() - _timer_t
                         den_scale = best_metrics["density_cost"] / (current_den + 1e-8)
                         cong_scale = best_metrics["congestion_cost"] / (current_cong + 1e-8)
                         current_proxy = (
@@ -3759,8 +3953,12 @@ class HybridAnalyticalPlacer:
             )
             if sweep_accepts == 0:
                 if accepts > last_checkpoint_accepts:
+                    if timing_enabled:
+                        _timer_t = time()
                     _set_placement(plc, cd_placement.detach(), benchmark)
                     metrics = compute_proxy_cost(cd_placement.detach(), benchmark, plc)
+                    if timing_enabled:
+                        cd_timers["real"] += time() - _timer_t
                     proxy = metrics["proxy_cost"]
                     print(
                         f"  soft_cd no_move_chk accepts={accepts} evals={evals} "
@@ -3805,8 +4003,12 @@ class HybridAnalyticalPlacer:
                     break
 
         if accepts > last_checkpoint_accepts:
+            if timing_enabled:
+                _timer_t = time()
             _set_placement(plc, cd_placement.detach(), benchmark)
             metrics = compute_proxy_cost(cd_placement.detach(), benchmark, plc)
+            if timing_enabled:
+                cd_timers["real"] += time() - _timer_t
             proxy = metrics["proxy_cost"]
             print(
                 f"  soft_cd final_chk accepts={accepts} evals={evals} "
@@ -3820,6 +4022,117 @@ class HybridAnalyticalPlacer:
             f"Soft CD done: sweeps={sweeps} accepts={accepts} "
             f"evals={evals} best proxy={best_proxy:.4f}"
         )
+        if timing_enabled:
+            timed_total = max(1e-9, sum(cd_timers.values()))
+            print(
+                "Soft CD timing: "
+                + " ".join(
+                    f"{k}={v:.2f}s({100.0*v/timed_total:.0f}%)"
+                    for k, v in cd_timers.items()
+                    if v > 0.0
+                )
+                + f" timed={timed_total:.2f}s wall={time()-t0:.2f}s"
+        )
+        return best_placement
+
+    def _soft_perturb_escape(
+        self,
+        placement,
+        benchmark,
+        plc,
+        net_indices,
+        net_mask,
+        net_weights,
+        canvas_norm,
+        num_hard,
+        num_all,
+        fixed,
+        budget=300,
+    ):
+        """Soft-only basin hop: shake a large soft subset, repair, keep if real proxy improves."""
+        num_soft = num_all - num_hard
+        if num_soft < 1 or budget <= 0:
+            return placement
+
+        trials = max(1, int(os.environ.get("HAP_ESCAPE_TRIALS", "2")))
+        frac = min(1.0, max(0.02, float(os.environ.get("HAP_ESCAPE_FRAC", "0.45"))))
+        sigma = max(0.001, float(os.environ.get("HAP_ESCAPE_SIGMA", "0.06")))
+        repair_frac = min(0.90, max(0.20, float(os.environ.get("HAP_ESCAPE_REPAIR_FRAC", "0.70"))))
+        trial_budget = max(20.0, float(budget) * repair_frac / trials)
+
+        _set_placement(plc, placement.detach(), benchmark)
+        best_metrics = compute_proxy_cost(placement.detach(), benchmark, plc)
+        best_proxy = float(best_metrics["proxy_cost"])
+        best_placement = placement.clone()
+        rng = np.random.default_rng(self.seed + 91073 + int(num_soft))
+        hw = benchmark.macro_sizes[:, 0] / 2
+        hh = benchmark.macro_sizes[:, 1] / 2
+        soft_indices = np.array(
+            [i for i in range(num_hard, num_all) if not fixed[i].item()],
+            dtype=np.int32,
+        )
+        if soft_indices.size == 0:
+            return placement
+
+        print(
+            f"Perturb escape start: proxy={best_proxy:.4f} trials={trials} "
+            f"frac={frac:.2f} sigma={sigma:.3f} repair_budget={trial_budget:.0f}s"
+        )
+        t0 = time()
+        for trial in range(1, trials + 1):
+            if time() - t0 > budget:
+                break
+            cand = best_placement.clone()
+            k = max(1, int(round(frac * soft_indices.size)))
+            chosen = rng.choice(soft_indices, size=min(k, soft_indices.size), replace=False)
+            chosen_t = torch.as_tensor(chosen, dtype=torch.long)
+            dx = rng.normal(0.0, sigma * benchmark.canvas_width, size=chosen.size)
+            dy = rng.normal(0.0, sigma * benchmark.canvas_height, size=chosen.size)
+            cand[chosen_t, 0] = torch.clamp(
+                cand[chosen_t, 0] + torch.tensor(dx, dtype=cand.dtype),
+                min=hw[chosen_t],
+                max=benchmark.canvas_width - hw[chosen_t],
+            )
+            cand[chosen_t, 1] = torch.clamp(
+                cand[chosen_t, 1] + torch.tensor(dy, dtype=cand.dtype),
+                min=hh[chosen_t],
+                max=benchmark.canvas_height - hh[chosen_t],
+            )
+
+            _set_placement(plc, cand.detach(), benchmark)
+            shaken_proxy = float(compute_proxy_cost(cand.detach(), benchmark, plc)["proxy_cost"])
+            print(
+                f"  escape trial={trial} shaken={shaken_proxy:.4f} "
+                f"best={best_proxy:.4f} [{time()-t0:.0f}s]"
+            )
+            repair_budget = min(trial_budget, max(1.0, budget - (time() - t0)))
+            repaired = self._sa_soft_displace(
+                cand,
+                benchmark,
+                plc,
+                net_indices,
+                net_mask,
+                net_weights,
+                canvas_norm,
+                num_hard,
+                num_all,
+                fixed,
+                budget=repair_budget,
+                checkpoint_every=200,
+            )
+            _set_placement(plc, repaired.detach(), benchmark)
+            metrics = compute_proxy_cost(repaired.detach(), benchmark, plc)
+            proxy = float(metrics["proxy_cost"])
+            print(
+                f"  escape trial={trial} repaired={proxy:.4f} "
+                f"den={metrics['density_cost']:.4f} cong={metrics['congestion_cost']:.4f} "
+                f"best={best_proxy:.4f} [{time()-t0:.0f}s]"
+            )
+            if proxy < best_proxy:
+                best_proxy = proxy
+                best_placement = repaired.clone()
+
+        print(f"Perturb escape done: best proxy={best_proxy:.4f}")
         return best_placement
 
     def _soft_net_shear_refine(
@@ -5047,9 +5360,22 @@ class HybridAnalyticalPlacer:
             f"wl={total_wl:.4f} num_soft={num_soft} "
             f"(HV cong, smooth={smooth_range})"
         )
+        timing_enabled = os.environ.get("HAP_STAGE_TIMERS", "").strip().lower() not in (
+            "", "0", "false", "no", "off"
+        )
+        sd_timers = {
+            "proposal": 0.0,
+            "hpwl": 0.0,
+            "density": 0.0,
+            "route": 0.0,
+            "rollback": 0.0,
+            "rebuild": 0.0,
+            "real": 0.0,
+        }
 
         accepts = total = stalls = 0
         last_accept_step = 0
+        last_checkpoint_accepts = 0
         last_rebuild_accepts = 0
         t0 = time()
         disp_start = canvas_norm * 0.01
@@ -5058,16 +5384,18 @@ class HybridAnalyticalPlacer:
         last_check_accepts = 0
         min_rate = 5e-5
         progress_gate = WindowProgressGate(
-            window=5,
-            patience_windows=4,
-            epsilon=0.0008,
-            min_time=min(420.0, max(0.0, float(budget))),
+            window=4,
+            patience_windows=2,
+            epsilon=0.0010,
+            min_time=min(300.0, max(0.0, float(budget))),
             initial_best=best_proxy,
         )
 
         def rebuild_fast_state(from_tensor):
             nonlocal sa_placement, sa_pos, net_hpwl, total_wl
             nonlocal current_den, current_cong, current_proxy, cong_tracker
+            if timing_enabled:
+                _timer_t = time()
             sa_placement = from_tensor.clone()
             sa_pos[:] = sa_placement.detach().numpy()
             net_hpwl[:] = _hpwl_batch(np.arange(num_nets, dtype=np.int32), ni_np, nm_np, sa_pos)
@@ -5100,6 +5428,8 @@ class HybridAnalyticalPlacer:
                 + 0.5 * current_den * den_scale
                 + 0.5 * current_cong * cong_scale
             )
+            if timing_enabled:
+                sd_timers["rebuild"] += time() - _timer_t
 
         for _ in range(100_000_000):
             if time() - t0 > budget:
@@ -5132,8 +5462,12 @@ class HybridAnalyticalPlacer:
                     break
                 last_check_accepts = accepts
 
+            if timing_enabled:
+                _timer_t = time()
             i = num_hard + random.randint(0, num_soft - 1)
             if fixed[i].item() or len(macro_to_nets[i]) == 0:
+                if timing_enabled:
+                    sd_timers["proposal"] += time() - _timer_t
                 continue
 
             total += 1
@@ -5153,19 +5487,32 @@ class HybridAnalyticalPlacer:
                     benchmark.canvas_height - hh_np[i],
                 )
             )
+            if timing_enabled:
+                sd_timers["proposal"] += time() - _timer_t
 
             aff = macro_to_nets[i]
+            if timing_enabled:
+                _timer_t = time()
             old_hpwl = net_hpwl[aff].copy()
             sa_pos[i, 0] = new_x
             sa_pos[i, 1] = new_y
             new_hpwl = _hpwl_batch(aff, ni_np, nm_np, sa_pos)
             wl_delta = float((new_hpwl - old_hpwl).sum()) / (num_nets * canvas_norm)
+            if timing_enabled:
+                sd_timers["hpwl"] += time() - _timer_t
 
+            if timing_enabled:
+                _timer_t = time()
             _update_density_incr(
                 density_grid, old_x, old_y, new_x, new_y,
                 hw_np[i], hh_np[i], bl, br, bb, bt, bin_area, n_rows, n_cols, bin_w, bin_h,
             )
             new_den = _density_cost_top5(density_grid)
+            if timing_enabled:
+                sd_timers["density"] += time() - _timer_t
+
+            if timing_enabled:
+                _timer_t = time()
             if _use_pin_routing:
                 pin_aff = macro_to_pin_nets[i]
                 if len(pin_aff) > 0:
@@ -5181,6 +5528,8 @@ class HybridAnalyticalPlacer:
                     i, old_x, old_y, bin_w, bin_h, n_rows, n_cols, hcap, vcap,
                 )
             new_cong = cong_tracker.cost()
+            if timing_enabled:
+                sd_timers["route"] += time() - _timer_t
             new_proxy = (
                 total_wl + wl_delta
                 + 0.5 * new_den * den_scale
@@ -5199,9 +5548,14 @@ class HybridAnalyticalPlacer:
                 last_accept_step = total
 
                 if accepts % checkpoint_every == 0:
+                    if timing_enabled:
+                        _timer_t = time()
                     _set_placement(plc, sa_placement.detach(), benchmark)
                     metrics = compute_proxy_cost(sa_placement.detach(), benchmark, plc)
+                    if timing_enabled:
+                        sd_timers["real"] += time() - _timer_t
                     proxy = metrics["proxy_cost"]
+                    last_checkpoint_accepts = accepts
                     print(
                         f"  step={total} accepts={accepts} wl={total_wl:.4f} "
                         f"fast={current_proxy:.4f} proxy={proxy:.4f} "
@@ -5222,8 +5576,12 @@ class HybridAnalyticalPlacer:
                         stalls = 0
                     else:
                         rebuild_fast_state(best_placement)
+                        if timing_enabled:
+                            _timer_t = time()
                         _set_placement(plc, sa_placement.detach(), benchmark)
                         best_metrics = compute_proxy_cost(sa_placement.detach(), benchmark, plc)
+                        if timing_enabled:
+                            sd_timers["real"] += time() - _timer_t
                         den_scale = best_metrics["density_cost"] / (current_den + 1e-8)
                         cong_scale = best_metrics["congestion_cost"] / (current_cong + 1e-8)
                         current_proxy = (
@@ -5240,6 +5598,8 @@ class HybridAnalyticalPlacer:
                         )
                         break
             else:
+                if timing_enabled:
+                    _timer_t = time()
                 sa_pos[i, 0] = old_x
                 sa_pos[i, 1] = old_y
                 _update_density_incr(
@@ -5260,15 +5620,46 @@ class HybridAnalyticalPlacer:
                         h_route_grid, v_route_grid, cong_tracker, ni_np, nm_np, nw_np, sa_pos, aff,
                         i, new_x, new_y, bin_w, bin_h, n_rows, n_cols, hcap, vcap,
                     )
+                if timing_enabled:
+                    sd_timers["rollback"] += time() - _timer_t
 
             if total - last_accept_step > 2_000_000:
                 print("Soft displace: no accepts in 2M attempts, stopping")
                 break
 
+        if accepts > last_checkpoint_accepts:
+            if timing_enabled:
+                _timer_t = time()
+            _set_placement(plc, sa_placement.detach(), benchmark)
+            metrics = compute_proxy_cost(sa_placement.detach(), benchmark, plc)
+            if timing_enabled:
+                sd_timers["real"] += time() - _timer_t
+            proxy = metrics["proxy_cost"]
+            print(
+                f"  step={total} accepts={accepts} wl={total_wl:.4f} "
+                f"fast={current_proxy:.4f} proxy={proxy:.4f} "
+                f"den={metrics['density_cost']:.4f} cong={metrics['congestion_cost']:.4f} "
+                f"final_chk [{time()-t0:.0f}s]"
+            )
+            if proxy < best_proxy:
+                best_proxy = proxy
+                best_placement = sa_placement.clone()
+
         print(
             f"Soft displace done: {total} attempts, {accepts} accepts, "
             f"best proxy={best_proxy:.4f}"
         )
+        if timing_enabled:
+            timed_total = max(1e-9, sum(sd_timers.values()))
+            print(
+                "Soft displace timing: "
+                + " ".join(
+                    f"{k}={v:.2f}s({100.0*v/timed_total:.0f}%)"
+                    for k, v in sd_timers.items()
+                    if v > 0.0
+                )
+                + f" timed={timed_total:.2f}s wall={time()-t0:.2f}s"
+            )
         return best_placement
 
     def _build_incremental_wl(
