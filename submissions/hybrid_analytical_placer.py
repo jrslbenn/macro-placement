@@ -1714,39 +1714,67 @@ class HybridAnalyticalPlacer:
 
         policy_initial_cong = float(getattr(self, "_initial_congestion_cost", 0.0))
         policy_initial_density = float(getattr(self, "_initial_density_cost", 0.0))
+        policy_num_soft = int(getattr(benchmark, "num_soft_macros", max(0, num_all - num_hard)))
         high_cong_bench = policy_initial_cong >= 2.10
         very_high_cong_bench = policy_initial_cong >= 2.30
         if very_high_cong_bench:
             hard_swap_max_budget = 60
             soft_swap_max_budget = 240
-            soft_displace_max_budget = 1800
-            soft_cd_max_budget = 900
-            soft_cd_base_budget = 360
-            soft_cd_extension_budget = 150
-            hard_displace_max_budget = 300
+            soft_displace_max_budget = 2000
+            soft_cd_max_budget = 720
+            soft_cd_base_budget = 300
+            soft_cd_extension_budget = 120
+            hard_displace_max_budget = 240
             budget_policy = "very_high_cong"
         elif high_cong_bench:
             hard_swap_max_budget = 75
             soft_swap_max_budget = 270
-            soft_displace_max_budget = 1550
-            soft_cd_max_budget = 870
-            soft_cd_base_budget = 330
-            soft_cd_extension_budget = 135
-            hard_displace_max_budget = 420
+            soft_displace_max_budget = 1700
+            soft_cd_max_budget = 720
+            soft_cd_base_budget = 270
+            soft_cd_extension_budget = 120
+            hard_displace_max_budget = 300
             budget_policy = "high_cong"
         else:
             hard_swap_max_budget = 90
             soft_swap_max_budget = 240
-            soft_displace_max_budget = 1200
-            soft_cd_max_budget = 900
+            soft_displace_max_budget = 1300
+            soft_cd_max_budget = 780
             soft_cd_base_budget = 240
             soft_cd_extension_budget = 120
-            hard_displace_max_budget = 600
+            hard_displace_max_budget = 450
             budget_policy = "default"
+
+        if policy_num_soft >= 1500:
+            soft_macro_bonus = 150
+        elif policy_num_soft >= 1000:
+            soft_macro_bonus = 100
+        elif policy_num_soft >= 700:
+            soft_macro_bonus = 50
+        else:
+            soft_macro_bonus = 0
+        soft_displace_max_budget += soft_macro_bonus
+        if soft_macro_bonus:
+            soft_cd_max_budget = max(480, soft_cd_max_budget - soft_macro_bonus // 3)
+            hard_displace_max_budget = max(180, hard_displace_max_budget - soft_macro_bonus // 4)
+
+        soft_displace_max_budget = int(
+            os.environ.get("HAP_SOFT_DISPLACE_MAX", soft_displace_max_budget)
+        )
+        soft_cd_max_budget = int(os.environ.get("HAP_SOFT_CD_MAX", soft_cd_max_budget))
+        soft_cd_base_budget = int(os.environ.get("HAP_SOFT_CD_BASE", soft_cd_base_budget))
+        soft_cd_extension_budget = int(
+            os.environ.get("HAP_SOFT_CD_EXTENSION", soft_cd_extension_budget)
+        )
+        hard_displace_max_budget = int(
+            os.environ.get("HAP_HARD_DISPLACE_MAX", hard_displace_max_budget)
+        )
         print(
             f"Budget policy: {budget_policy} "
             f"init_den={policy_initial_density:.4f} init_cong={policy_initial_cong:.4f} "
-            f"soft_displace_max={soft_displace_max_budget}s soft_cd_max={soft_cd_max_budget}s"
+            f"num_soft={policy_num_soft} soft_bonus={soft_macro_bonus}s "
+            f"soft_displace_max={soft_displace_max_budget}s "
+            f"soft_cd_max={soft_cd_max_budget}s hard_displace_max={hard_displace_max_budget}s"
         )
         sparse_checkpoints = os.environ.get("HAP_SPARSE_CHECKPOINTS", "1").strip().lower() not in (
             "", "0", "false", "no", "off"
@@ -2099,6 +2127,45 @@ class HybridAnalyticalPlacer:
             #     budget=180,
             # )
 
+            tail_soft_enabled = os.environ.get("HAP_TAIL_SOFT_DISPLACE", "1").strip().lower() not in (
+                "", "0", "false", "no", "off"
+            )
+            if tail_soft_enabled and benchmark.num_soft_macros > 1:
+                elapsed = time() - start_time
+                hard_remaining = hard_time_budget - elapsed
+                tail_min = float(os.environ.get("HAP_TAIL_SOFT_DISPLACE_MIN", "180"))
+                tail_reserve = float(os.environ.get("HAP_TAIL_SOFT_DISPLACE_RESERVE", "75"))
+                tail_max = float(os.environ.get("HAP_TAIL_SOFT_DISPLACE_MAX", "600"))
+                tail_budget = min(tail_max, max(0.0, hard_remaining - tail_reserve))
+                print(
+                    f"Tail soft displace budget: {tail_budget:.0f}s "
+                    f"(elapsed={elapsed:.1f}s hard_remaining={hard_remaining:.1f}s "
+                    f"reserve={tail_reserve:.0f}s)"
+                )
+                if tail_budget >= tail_min:
+                    best_valid_placement = self._sa_soft_displace(
+                        best_valid_placement,
+                        benchmark,
+                        plc,
+                        net_indices,
+                        net_mask,
+                        net_weights,
+                        canvas_norm,
+                        num_hard,
+                        num_all,
+                        fixed,
+                        budget=tail_budget,
+                        checkpoint_every=soft_displace_checkpoint_every,
+                    )
+                    _save_plot("08c_tail_soft_displace", best_valid_placement)
+                else:
+                    print(
+                        f"Tail soft displace skipped: budget {tail_budget:.1f}s "
+                        f"< min {tail_min:.1f}s"
+                    )
+            elif not tail_soft_enabled:
+                print("Tail soft displace disabled")
+
 
         # Soft settle was score-neutral to slightly harmful in current logs, so
         # keep the post-SA placement exactly as selected by real-proxy stages.
@@ -2261,7 +2328,7 @@ class HybridAnalyticalPlacer:
             max_displacement = canvas_norm * 0.03
             no_accept_limit = max(
                 100_000,
-                int(os.environ.get("HAP_HARD_NO_ACCEPT_LIMIT", "1000000")),
+                int(os.environ.get("HAP_HARD_NO_ACCEPT_LIMIT", "250000")),
             )
 
             for _ in range(100_000_000):
@@ -2720,7 +2787,7 @@ class HybridAnalyticalPlacer:
 
         no_accept_limit = max(
             100_000,
-            int(os.environ.get("HAP_HARD_NO_ACCEPT_LIMIT", "1000000")),
+            int(os.environ.get("HAP_HARD_NO_ACCEPT_LIMIT", "250000")),
         )
 
         for _ in range(100_000_000):
@@ -3974,6 +4041,13 @@ class HybridAnalyticalPlacer:
 
         for _ in range(100_000_000):
             if time() - t0 > active_budget:
+                if accepts > last_checkpoint_accepts:
+                    old_budget = active_budget
+                    if checkpoint(label="time_chk "):
+                        print("Soft swap stalled")
+                        break
+                    if active_budget > old_budget and time() - t0 <= active_budget:
+                        continue
                 break
             if (
                 accepts > 0
@@ -4654,12 +4728,14 @@ class HybridAnalyticalPlacer:
             return clipped
 
         accepts = evals = stalls = sweeps = 0
+        real_misses = 0
         last_checkpoint_accepts = 0
         t0 = time()
         max_budget = max(0.0, float(budget))
         active_budget = min(max_budget, max(0.0, float(base_budget)))
         extension_budget = max(0.0, float(extension_budget))
         extension_anchor = best_proxy
+        real_miss_limit = max(1, int(os.environ.get("HAP_SOFT_CD_REAL_MISS_LIMIT", "2")))
         progress_gate = WindowProgressGate(
             window=5,
             patience_windows=2,
@@ -4792,6 +4868,7 @@ class HybridAnalyticalPlacer:
                         best_proxy = proxy
                         best_placement = cd_placement.clone()
                         stalls = 0
+                        real_misses = 0
                         if (
                             extension_anchor - best_proxy >= extension_gain
                             and extension_budget > 0.0
@@ -4805,6 +4882,7 @@ class HybridAnalyticalPlacer:
                                 f"best={best_proxy:.4f} [{time()-t0:.0f}s]"
                             )
                     else:
+                        real_misses += 1
                         rebuild_fast_state(best_placement)
                         if timing_enabled:
                             _timer_t = time()
@@ -4824,6 +4902,14 @@ class HybridAnalyticalPlacer:
                             f"Soft CD stalled "
                             f"(window gate, best={progress_gate.best:.4f}, "
                             f"patience={progress_gate.patience}/{progress_gate.max_patience})"
+                        )
+                        stop_cd = True
+                        break
+                    if real_misses >= real_miss_limit:
+                        print(
+                            f"Soft CD stalled "
+                            f"(real miss limit {real_misses}/{real_miss_limit}, "
+                            f"best={best_proxy:.4f})"
                         )
                         stop_cd = True
                         break
@@ -4861,6 +4947,7 @@ class HybridAnalyticalPlacer:
                         best_proxy = proxy
                         best_placement = cd_placement.clone()
                         stalls = 0
+                        real_misses = 0
                         if (
                             extension_anchor - best_proxy >= extension_gain
                             and extension_budget > 0.0
@@ -4872,13 +4959,21 @@ class HybridAnalyticalPlacer:
                             print(
                                 f"  soft_cd extend: {old_budget:.0f}s->{active_budget:.0f}s "
                                 f"best={best_proxy:.4f} [{time()-t0:.0f}s]"
-                            )
+                        )
                         continue
+                    real_misses += 1
                     if gate_stop:
                         print(
                             f"Soft CD stalled "
                             f"(window gate, best={progress_gate.best:.4f}, "
                             f"patience={progress_gate.patience}/{progress_gate.max_patience})"
+                        )
+                        break
+                    if real_misses >= real_miss_limit:
+                        print(
+                            f"Soft CD stalled "
+                            f"(real miss limit {real_misses}/{real_miss_limit}, "
+                            f"best={best_proxy:.4f})"
                         )
                         break
                 stalls += 1

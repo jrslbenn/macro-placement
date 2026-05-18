@@ -26,12 +26,29 @@ def main():
     parser.add_argument("--bench-dir", required=True)
     parser.add_argument("--bench-name", required=True)
     parser.add_argument("--init-strategy", required=True,
-                        choices=["ibm", "spectral", "perturbed", "random"])
+                        choices=["provided", "initial", "spectral", "perturbed", "halton", "random"])
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--init-perturb-sigma", type=float, default=0.05)
+    parser.add_argument("--init-spectral-blend", type=float, default=0.70)
+    parser.add_argument("--init-spectral-flip-x", type=int, default=0)
+    parser.add_argument("--init-spectral-flip-y", type=int, default=0)
+    parser.add_argument("--init-jitter-sigma", type=float, default=0.0)
     parser.add_argument("--num-steps", type=int, default=50000)
     parser.add_argument("--enable-plots", type=int, default=0)
+    parser.add_argument("--threads", type=int, default=2)
+    parser.add_argument("--log-dir", default="")
+    parser.add_argument("--vis-dir", default="")
     parser.add_argument("--out-path", required=True)
     args = parser.parse_args()
+
+    thread_s = str(max(1, args.threads))
+    os.environ.setdefault("OMP_NUM_THREADS", thread_s)
+    os.environ.setdefault("MKL_NUM_THREADS", thread_s)
+    os.environ.setdefault("NUMBA_NUM_THREADS", thread_s)
+    if args.log_dir:
+        os.environ["HAP_LOG_DIR"] = args.log_dir
+    if args.vis_dir:
+        os.environ["HAP_VIS_DIR"] = args.vis_dir
 
     from macro_place.loader import load_benchmark_from_dir
     from macro_place.objective import compute_proxy_cost
@@ -39,7 +56,7 @@ def main():
 
     print(
         f"[worker] bench={args.bench_name} strategy={args.init_strategy} "
-        f"seed={args.seed} num_steps={args.num_steps}",
+        f"seed={args.seed} num_steps={args.num_steps} threads={thread_s}",
         flush=True,
     )
 
@@ -52,6 +69,11 @@ def main():
         verbose=True,
         enable_plots=bool(args.enable_plots),
         init_strategy=args.init_strategy,
+        init_perturb_sigma=args.init_perturb_sigma,
+        init_spectral_blend=args.init_spectral_blend,
+        init_spectral_flip_x=bool(args.init_spectral_flip_x),
+        init_spectral_flip_y=bool(args.init_spectral_flip_y),
+        init_jitter_sigma=args.init_jitter_sigma,
     )
 
     placement = placer.place(benchmark)
@@ -66,6 +88,11 @@ def main():
         "overlap_count": int(metrics["overlap_count"]),
         "strategy": args.init_strategy,
         "seed": args.seed,
+        "init_perturb_sigma": args.init_perturb_sigma,
+        "init_spectral_blend": args.init_spectral_blend,
+        "init_spectral_flip_x": bool(args.init_spectral_flip_x),
+        "init_spectral_flip_y": bool(args.init_spectral_flip_y),
+        "init_jitter_sigma": args.init_jitter_sigma,
     }
     with open(args.out_path, "wb") as f:
         pickle.dump(out, f)

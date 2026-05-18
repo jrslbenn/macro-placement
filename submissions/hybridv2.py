@@ -475,11 +475,11 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
         verbose: bool = True,
         enable_plots: bool = True,
         # Initial placement strategy — for multi-init parallel runs.
-        # 'ibm':      use benchmark's IBM 2004 floorplan (default)
+        # 'provided': use the benchmark-provided initial placement (default)
         # 'spectral': Fiedler-vector spectral layout (parent's helper)
-        # 'perturbed': IBM + Gaussian noise (seed-controlled), then legalize
+        # 'perturbed': provided placement + Gaussian noise, then legalize
         # 'random':   uniform random, then legalize
-        init_strategy: str = "ibm",
+        init_strategy: str = "provided",
         init_perturb_sigma: float = 0.05,  # used when init_strategy='perturbed'
         init_spectral_blend: float = 0.70,
         init_spectral_flip_x: bool = False,
@@ -493,9 +493,12 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
         das_amp_beta: float = 0.6,
         das_max_amp: float = 4.0,
         # ── Channel relocate ──
-        ch_enable: bool = True,
-        ch_budget: float = 180.0,
-        ch_max_stale_sweeps: int = 3,
+        # Kept as an env-enabled tail experiment. The prev_logs sweep showed
+        # tiny average gain from hard channel (~7e-4/proxy) and many zero-gain
+        # benches, so default runtime is better kept out of this tail stage.
+        ch_enable: bool = False,
+        ch_budget: float = 90.0,
+        ch_max_stale_sweeps: int = 2,
         ch_max_stale_checkpoints: int = 3,
         ch_checkpoint_accepts: int = 24,
         ch_checkpoint_seconds: float = 30.0,
@@ -518,14 +521,14 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
         # Soft macros redistribute under WL+density gradient; hard macros
         # are tethered to their channel-relocated positions (±tether_frac
         # × canvas span). Targets the "sea of soft macros" issue on
-        # congestion-bound benches (ibm17/18) where channel relocate
+        # congestion-bound benches where channel relocate
         # alone stalls because the bottleneck is downstream of where
         # hard-macro moves operate.
         # Disabled by default after the incremental-real-eval sweep: every
-        # logged IBM run restored the pre-polish best checkpoint, so this is
+        # logged sweep run restored the pre-polish best checkpoint, so this is
         # currently an experiment knob rather than a productive stage.
         polish_enable: bool = False,
-        # On cong-bound benches (ibm17/18) channel relocate stalls
+        # On congestion-bound benches channel relocate stalls
         # immediately because congestion is global (no low-pressure
         # target bins exist for single-macro relocation). Polish is the
         # only stage producing gains there because it does coordinated
@@ -608,6 +611,22 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
         self._cached_net_indices: torch.Tensor | None = None
         self._cached_net_mask: torch.Tensor | None = None
         self._cached_net_weights: torch.Tensor | None = None
+
+        hard_channel_env = os.environ.get("HAP_HARD_CHANNEL")
+        if hard_channel_env is not None:
+            self.ch_enable = hard_channel_env.strip().lower() not in (
+                "", "0", "false", "no", "off"
+            )
+        self.ch_budget = float(os.environ.get("HAP_HARD_CHANNEL_BUDGET", self.ch_budget))
+        self.ch_max_stale_sweeps = int(
+            os.environ.get("HAP_HARD_CHANNEL_STALE_SWEEPS", self.ch_max_stale_sweeps)
+        )
+        self.ch_checkpoint_accepts = int(
+            os.environ.get("HAP_HARD_CHANNEL_CKPT_ACCEPTS", self.ch_checkpoint_accepts)
+        )
+        self.ch_checkpoint_seconds = float(
+            os.environ.get("HAP_HARD_CHANNEL_CKPT_SECONDS", self.ch_checkpoint_seconds)
+        )
 
         post_nesterov = os.environ.get("HAP_POST_NESTEROV", "").strip().lower()
         if post_nesterov not in ("", "0", "false", "no", "off"):
@@ -2205,8 +2224,8 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
     def _apply_init_strategy(self, benchmark: Benchmark) -> Benchmark:
         """Replace benchmark.macro_positions per init_strategy. Returns the
         (possibly modified) benchmark. Does NOT mutate the original."""
-        if self.init_strategy == "ibm":
-            return benchmark  # use the default IBM 2004 floorplan as-is
+        if self.init_strategy in ("provided", "initial"):
+            return benchmark  # use the benchmark-provided initial placement as-is
 
         import copy
         bench = copy.copy(benchmark)
@@ -2288,7 +2307,7 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
         )
         if benchmark.macro_fixed.any():
             bench.macro_positions[benchmark.macro_fixed] = benchmark.macro_positions[benchmark.macro_fixed]
-        if self.verbose:
+        if self.verbose and self.init_strategy not in ("provided", "initial"):
             detail = ""
             if self.init_strategy == "perturbed":
                 detail = f" sigma={self.init_perturb_sigma:.3f}"
@@ -2337,7 +2356,7 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
         self._save_v2_stage(plc, benchmark, refined, "10_hard_channel")
 
         # Soft channel relocate is opt-in. It measured as a tiny gain on
-        # only two IBM benches, so default runs skip it.
+        # only a couple of sweep benches, so default runs skip it.
         soft_relocated = refined
         if self.sch_enable:
             soft_relocated = self._soft_channel_relocate(
