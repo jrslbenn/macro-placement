@@ -109,7 +109,7 @@ class HybridAnalyticalPlacerV2Multi:
         verbose: bool = True,
         enable_plots: bool = True,
         workers: List[Dict[str, Any]] | None = None,
-        threads_per_worker: int = 2,
+        threads_per_worker: int = 3,
     ):
         self.seed = seed
         self.num_steps = num_steps
@@ -183,7 +183,7 @@ class HybridAnalyticalPlacerV2Multi:
         if self.verbose:
             print(f"[multi] waiting for {len(procs)} workers...", flush=True)
         start_t = time.time()
-        worker_timeout = float(os.environ.get("HAP_MULTI_WORKER_TIMEOUT", "3300"))
+        worker_timeout = float(os.environ.get("HAP_MULTI_WORKER_TIMEOUT", "3200"))
         for label, p, log_f, log_path in procs:
             remaining_timeout = max(1.0, worker_timeout - (time.time() - start_t))
             try:
@@ -262,7 +262,7 @@ def main():
         verbose=True,
         enable_plots=False,
         workers=worker_variants_from_env(),
-        threads_per_worker=int(os.environ.get("HAP_MULTI_THREADS", "2")),
+        threads_per_worker=int(os.environ.get("HAP_MULTI_THREADS", "3")),
     )
     placement = placer.place(benchmark)
     metrics = compute_proxy_cost(placement, benchmark, plc)

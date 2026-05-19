@@ -2127,6 +2127,50 @@ class HybridAnalyticalPlacer:
             #     budget=180,
             # )
 
+            tail_soft_swap_enabled = os.environ.get("HAP_TAIL_SOFT_SWAP", "1").strip().lower() not in (
+                "", "0", "false", "no", "off"
+            )
+            if tail_soft_swap_enabled and benchmark.num_soft_macros > 1:
+                elapsed = time() - start_time
+                hard_remaining = hard_time_budget - elapsed
+                tail_swap_min = float(os.environ.get("HAP_TAIL_SOFT_SWAP_MIN", "90"))
+                tail_swap_reserve = float(os.environ.get("HAP_TAIL_SOFT_SWAP_RESERVE", "260"))
+                tail_swap_max = float(os.environ.get("HAP_TAIL_SOFT_SWAP_MAX", "150"))
+                tail_swap_budget = min(
+                    tail_swap_max,
+                    max(0.0, hard_remaining - tail_swap_reserve),
+                )
+                print(
+                    f"Tail soft swap budget: {tail_swap_budget:.0f}s "
+                    f"(elapsed={elapsed:.1f}s hard_remaining={hard_remaining:.1f}s "
+                    f"reserve={tail_swap_reserve:.0f}s)"
+                )
+                if tail_swap_budget >= tail_swap_min:
+                    best_valid_placement = self._sa_soft_swap(
+                        best_valid_placement,
+                        benchmark,
+                        plc,
+                        net_indices,
+                        net_mask,
+                        net_weights,
+                        canvas_norm,
+                        num_hard,
+                        num_all,
+                        budget=tail_swap_budget,
+                        base_budget=min(90, tail_swap_budget),
+                        extension_budget=30,
+                        extension_gain=0.0015,
+                        checkpoint_every=soft_swap_checkpoint_every,
+                    )
+                    _save_plot("08c_tail_soft_swap", best_valid_placement)
+                else:
+                    print(
+                        f"Tail soft swap skipped: budget {tail_swap_budget:.1f}s "
+                        f"< min {tail_swap_min:.1f}s"
+                    )
+            elif not tail_soft_swap_enabled:
+                print("Tail soft swap disabled")
+
             tail_soft_enabled = os.environ.get("HAP_TAIL_SOFT_DISPLACE", "1").strip().lower() not in (
                 "", "0", "false", "no", "off"
             )
@@ -2157,7 +2201,7 @@ class HybridAnalyticalPlacer:
                         budget=tail_budget,
                         checkpoint_every=soft_displace_checkpoint_every,
                     )
-                    _save_plot("08c_tail_soft_displace", best_valid_placement)
+                    _save_plot("08d_tail_soft_displace", best_valid_placement)
                 else:
                     print(
                         f"Tail soft displace skipped: budget {tail_budget:.1f}s "
@@ -4104,9 +4148,15 @@ class HybridAnalyticalPlacer:
                 ss_timers["density_cong"] += time() - _timer_t
             candidate_wl = total_wl + delta
             new_proxy = total_wl + delta + 0.5 * new_den * den_scale + 0.5 * new_cong * cong_scale
+            wl_ok = candidate_wl <= wl_cap
+            if total_wl > wl_cap:
+                # If a rebuild/checkpoint exposes that we have drifted over the
+                # soft-swap WL cap, require recovery rather than an immediate
+                # return under cap. Otherwise the stage can freeze permanently.
+                wl_ok = candidate_wl < total_wl
 
             if (
-                (use_proxy_swap and new_proxy <= current_proxy and candidate_wl <= wl_cap)
+                (use_proxy_swap and new_proxy <= current_proxy and wl_ok)
                 or ((not use_proxy_swap) and delta <= 0.0)
             ):
                 sa_placement[i, 0] = float(sa_pos[i, 0])
@@ -4731,11 +4781,15 @@ class HybridAnalyticalPlacer:
         real_misses = 0
         last_checkpoint_accepts = 0
         t0 = time()
+        last_real_check_time = 0.0
         max_budget = max(0.0, float(budget))
         active_budget = min(max_budget, max(0.0, float(base_budget)))
         extension_budget = max(0.0, float(extension_budget))
         extension_anchor = best_proxy
         real_miss_limit = max(1, int(os.environ.get("HAP_SOFT_CD_REAL_MISS_LIMIT", "2")))
+        real_checkpoint_seconds = max(
+            20.0, float(os.environ.get("HAP_SOFT_CD_REAL_CKPT_SECONDS", "90"))
+        )
         progress_gate = WindowProgressGate(
             window=5,
             patience_windows=2,
@@ -4856,6 +4910,7 @@ class HybridAnalyticalPlacer:
                         f"[{time()-t0:.0f}s]"
                     )
                     last_checkpoint_accepts = accepts
+                    last_real_check_time = time() - t0
                     den_scale = metrics["density_cost"] / (current_den + 1e-8)
                     cong_scale = metrics["congestion_cost"] / (current_cong + 1e-8)
                     current_proxy = (
@@ -4921,6 +4976,79 @@ class HybridAnalyticalPlacer:
                 f"accepts={accepts} evals={evals} fast={current_proxy:.4f} "
                 f"best={best_proxy:.4f} [{time()-t0:.0f}s]"
             )
+            if (
+                sweep_accepts > 0
+                and accepts > last_checkpoint_accepts
+                and (time() - t0 - last_real_check_time) >= real_checkpoint_seconds
+            ):
+                if timing_enabled:
+                    _timer_t = time()
+                _set_placement(plc, cd_placement.detach(), benchmark)
+                metrics = compute_proxy_cost(cd_placement.detach(), benchmark, plc)
+                if timing_enabled:
+                    cd_timers["real"] += time() - _timer_t
+                proxy = metrics["proxy_cost"]
+                print(
+                    f"  soft_cd time_chk accepts={accepts} evals={evals} "
+                    f"proxy={proxy:.4f} best={best_proxy:.4f} [{time()-t0:.0f}s]"
+                )
+                last_checkpoint_accepts = accepts
+                last_real_check_time = time() - t0
+                den_scale = metrics["density_cost"] / (current_den + 1e-8)
+                cong_scale = metrics["congestion_cost"] / (current_cong + 1e-8)
+                current_proxy = (
+                    total_wl
+                    + 0.5 * current_den * den_scale
+                    + 0.5 * current_cong * cong_scale
+                )
+                _, gate_stop = progress_gate.update(proxy, time() - t0)
+                if proxy < best_proxy:
+                    best_proxy = proxy
+                    best_placement = cd_placement.clone()
+                    stalls = 0
+                    real_misses = 0
+                    if (
+                        extension_anchor - best_proxy >= extension_gain
+                        and extension_budget > 0.0
+                        and active_budget < max_budget - 1e-6
+                    ):
+                        old_budget = active_budget
+                        active_budget = min(max_budget, active_budget + extension_budget)
+                        extension_anchor = best_proxy
+                        print(
+                            f"  soft_cd extend: {old_budget:.0f}s->{active_budget:.0f}s "
+                            f"best={best_proxy:.4f} [{time()-t0:.0f}s]"
+                        )
+                    continue
+                real_misses += 1
+                rebuild_fast_state(best_placement)
+                if timing_enabled:
+                    _timer_t = time()
+                _set_placement(plc, cd_placement.detach(), benchmark)
+                best_metrics = compute_proxy_cost(cd_placement.detach(), benchmark, plc)
+                if timing_enabled:
+                    cd_timers["real"] += time() - _timer_t
+                den_scale = best_metrics["density_cost"] / (current_den + 1e-8)
+                cong_scale = best_metrics["congestion_cost"] / (current_cong + 1e-8)
+                current_proxy = (
+                    total_wl
+                    + 0.5 * current_den * den_scale
+                    + 0.5 * current_cong * cong_scale
+                )
+                if gate_stop:
+                    print(
+                        f"Soft CD stalled "
+                        f"(window gate, best={progress_gate.best:.4f}, "
+                        f"patience={progress_gate.patience}/{progress_gate.max_patience})"
+                    )
+                    break
+                if real_misses >= real_miss_limit:
+                    print(
+                        f"Soft CD stalled "
+                        f"(real miss limit {real_misses}/{real_miss_limit}, "
+                        f"best={best_proxy:.4f})"
+                    )
+                    break
             if sweep_accepts == 0:
                 if accepts > last_checkpoint_accepts:
                     if timing_enabled:
@@ -4935,6 +5063,7 @@ class HybridAnalyticalPlacer:
                         f"proxy={proxy:.4f} best={best_proxy:.4f} [{time()-t0:.0f}s]"
                     )
                     last_checkpoint_accepts = accepts
+                    last_real_check_time = time() - t0
                     den_scale = metrics["density_cost"] / (current_den + 1e-8)
                     cong_scale = metrics["congestion_cost"] / (current_cong + 1e-8)
                     current_proxy = (
