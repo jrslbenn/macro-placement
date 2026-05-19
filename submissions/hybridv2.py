@@ -43,6 +43,11 @@ _parent_spec = importlib.util.spec_from_file_location("_hap_parent", _PARENT_PAT
 _parent_mod = importlib.util.module_from_spec(_parent_spec)
 _parent_spec.loader.exec_module(_parent_mod)
 
+_IRE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "incremental_real_eval.py")
+_ire_spec = importlib.util.spec_from_file_location("_hap_incremental_real_eval", _IRE_PATH)
+_ire_mod = importlib.util.module_from_spec(_ire_spec)
+_ire_spec.loader.exec_module(_ire_mod)
+
 HybridAnalyticalPlacer = _parent_mod.HybridAnalyticalPlacer
 strong_legalize = _parent_mod.strong_legalize
 _build_density_grid = _parent_mod._build_density_grid
@@ -50,6 +55,22 @@ _update_density_incr = _parent_mod._update_density_incr
 _density_cost_top5 = _parent_mod._density_cost_top5
 _hpwl_batch = _parent_mod._hpwl_batch
 ProgressGate = _parent_mod.ProgressGate
+WindowProgressGate = _parent_mod.WindowProgressGate
+# Pin-level routing helpers (TILOS-faithful — closes cong calibration drift).
+_build_pin_hv_route_grid = _parent_mod._build_pin_hv_route_grid
+_update_pin_hv_route_incr_single = _parent_mod._update_pin_hv_route_incr_single
+build_pin_route_tensors = _parent_mod.build_pin_route_tensors
+build_macro_to_pin_nets = _parent_mod.build_macro_to_pin_nets
+TopKMeanTracker = _ire_mod.TopKMeanTracker
+SmoothHVTopKTracker = _ire_mod.SmoothHVTopKTracker
+SmoothHVCostTracker = _ire_mod.SmoothHVCostTracker
+update_density_tracker_from_diff = _ire_mod.update_density_tracker_from_diff
+update_density_incr_tracked = _ire_mod.update_density_incr_tracked
+update_macro_route_incr_tracked = _ire_mod.update_macro_route_incr_tracked
+update_hv_route_incr_single_tracked = _ire_mod.update_hv_route_incr_single_tracked
+update_pin_hv_route_incr_single_tracked = _ire_mod.update_pin_hv_route_incr_single_tracked
+update_hv_route_incr_single_smooth = _ire_mod.update_hv_route_incr_single_smooth
+update_pin_hv_route_incr_single_smooth = _ire_mod.update_pin_hv_route_incr_single_smooth
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -454,33 +475,42 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
         verbose: bool = True,
         enable_plots: bool = True,
         # Initial placement strategy — for multi-init parallel runs.
-        # 'ibm':      use benchmark's IBM 2004 floorplan (default)
+        # 'provided': use the benchmark-provided initial placement (default)
         # 'spectral': Fiedler-vector spectral layout (parent's helper)
-        # 'perturbed': IBM + Gaussian noise (seed-controlled), then legalize
+        # 'perturbed': provided placement + Gaussian noise, then legalize
         # 'random':   uniform random, then legalize
-        init_strategy: str = "ibm",
+        init_strategy: str = "provided",
         init_perturb_sigma: float = 0.05,  # used when init_strategy='perturbed'
+        init_spectral_blend: float = 0.70,
+        init_spectral_flip_x: bool = False,
+        init_spectral_flip_y: bool = False,
+        init_jitter_sigma: float = 0.0,
+        enable_soft_untwist: bool = False,
+        enable_net_shear: bool = False,
         # ── DAS-MP dataflow weighting ──
         das_enable: bool = True,
         das_indirect_alpha: float = 0.5,
         das_amp_beta: float = 0.6,
         das_max_amp: float = 4.0,
         # ── Channel relocate ──
-        ch_enable: bool = True,
-        ch_budget: float = 240.0,
-        ch_max_stale_sweeps: int = 3,
+        # Kept as an env-enabled tail experiment. The prev_logs sweep showed
+        # tiny average gain from hard channel (~7e-4/proxy) and many zero-gain
+        # benches, so default runtime is better kept out of this tail stage.
+        ch_enable: bool = False,
+        ch_budget: float = 90.0,
+        ch_max_stale_sweeps: int = 2,
         ch_max_stale_checkpoints: int = 3,
         ch_checkpoint_accepts: int = 24,
-        ch_checkpoint_seconds: float = 45.0,
+        ch_checkpoint_seconds: float = 30.0,
         ch_trial_cap: int = 24,
         # ── Soft channel relocate ──
         # Same algorithm as hard channel relocate, but operating on
         # standard-cell clusters [num_hard, num_all). No overlap check
         # (soft macros pile up — cost is density, not legality), no
-        # macro-route updates (hard macros stay fixed). Designed to give
-        # the soft sea long-range relocation capability so it can escape
-        # the post-Nesterov basin and clear wire-nests.
-        sch_enable: bool = True,
+        # macro-route updates (hard macros stay fixed). This was only a
+        # tiny win in the incremental-real-eval sweep, so keep it as an
+        # opt-in experiment and spend default runtime on stronger stages.
+        sch_enable: bool = False,
         sch_budget: float = 180.0,
         sch_max_stale_sweeps: int = 3,
         sch_max_stale_checkpoints: int = 3,
@@ -491,11 +521,14 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
         # Soft macros redistribute under WL+density gradient; hard macros
         # are tethered to their channel-relocated positions (±tether_frac
         # × canvas span). Targets the "sea of soft macros" issue on
-        # congestion-bound benches (ibm17/18) where channel relocate
+        # congestion-bound benches where channel relocate
         # alone stalls because the bottleneck is downstream of where
         # hard-macro moves operate.
-        polish_enable: bool = True,
-        # On cong-bound benches (ibm17/18) channel relocate stalls
+        # Disabled by default after the incremental-real-eval sweep: every
+        # logged sweep run restored the pre-polish best checkpoint, so this is
+        # currently an experiment knob rather than a productive stage.
+        polish_enable: bool = False,
+        # On congestion-bound benches channel relocate stalls
         # immediately because congestion is global (no low-pressure
         # target bins exist for single-macro relocation). Polish is the
         # only stage producing gains there because it does coordinated
@@ -519,6 +552,11 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
         polish_hard_cong_weight: float = 0.008,
         polish_cong_refresh: int = 20,
         polish_checkpoint_every: int = 50,
+        # ── Incremental real-eval keystone ──
+        # Exact top-K density/congestion trackers for channel stages. Keeps
+        # the old rebuild path available for A/B via ire_enable=False.
+        ire_enable: bool = True,
+        ire_debug_validate: bool = False,
     ):
         super().__init__(
             seed=seed,
@@ -528,6 +566,8 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
             soft_macro_lr=soft_macro_lr,
             verbose=verbose,
             enable_plots=enable_plots,
+            enable_soft_untwist=enable_soft_untwist,
+            enable_net_shear=enable_net_shear,
         )
         self.das_enable = das_enable
         self.das_indirect_alpha = das_indirect_alpha
@@ -558,13 +598,50 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
         self.polish_hard_cong_weight = polish_hard_cong_weight
         self.polish_cong_refresh = polish_cong_refresh
         self.polish_checkpoint_every = polish_checkpoint_every
+        self.ire_enable = ire_enable
+        self.ire_debug_validate = ire_debug_validate
         self.init_strategy = init_strategy
         self.init_perturb_sigma = init_perturb_sigma
+        self.init_spectral_blend = init_spectral_blend
+        self.init_spectral_flip_x = init_spectral_flip_x
+        self.init_spectral_flip_y = init_spectral_flip_y
+        self.init_jitter_sigma = init_jitter_sigma
         self._das_benchmark_ref: Benchmark | None = None
         self._cached_nets: List[List[int]] | None = None
         self._cached_net_indices: torch.Tensor | None = None
         self._cached_net_mask: torch.Tensor | None = None
         self._cached_net_weights: torch.Tensor | None = None
+
+        hard_channel_env = os.environ.get("HAP_HARD_CHANNEL")
+        if hard_channel_env is not None:
+            self.ch_enable = hard_channel_env.strip().lower() not in (
+                "", "0", "false", "no", "off"
+            )
+        self.ch_budget = float(os.environ.get("HAP_HARD_CHANNEL_BUDGET", self.ch_budget))
+        self.ch_max_stale_sweeps = int(
+            os.environ.get("HAP_HARD_CHANNEL_STALE_SWEEPS", self.ch_max_stale_sweeps)
+        )
+        self.ch_checkpoint_accepts = int(
+            os.environ.get("HAP_HARD_CHANNEL_CKPT_ACCEPTS", self.ch_checkpoint_accepts)
+        )
+        self.ch_checkpoint_seconds = float(
+            os.environ.get("HAP_HARD_CHANNEL_CKPT_SECONDS", self.ch_checkpoint_seconds)
+        )
+
+        post_nesterov = os.environ.get("HAP_POST_NESTEROV", "").strip().lower()
+        if post_nesterov not in ("", "0", "false", "no", "off"):
+            self.polish_enable = True
+            self.polish_steps = int(os.environ.get("HAP_POST_NESTEROV_STEPS", self.polish_steps))
+            self.polish_hard_tether_frac = float(
+                os.environ.get("HAP_POST_NESTEROV_TETHER", "0.005")
+            )
+            self.polish_hard_lr = float(os.environ.get("HAP_POST_NESTEROV_HARD_LR", "0.08"))
+            self.polish_soft_lr = float(os.environ.get("HAP_POST_NESTEROV_SOFT_LR", "0.08"))
+            print(
+                "[v2] post-refine Nesterov polish enabled "
+                f"steps={self.polish_steps} tether={self.polish_hard_tether_frac:.4f} "
+                f"hard_lr={self.polish_hard_lr:.3f} soft_lr={self.polish_soft_lr:.3f}"
+            )
 
     # ────────────────────────────────────────────────────────────────
     # DAS-MP dataflow-aware net weighting
@@ -763,20 +840,143 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
             density_grid, pos, sizes, num_all, bl, br, bb, bt, bin_area,
             n_rows, n_cols, bin_w, bin_h,
         )
-        _build_hv_route_grid(
-            h_route_grid, v_route_grid, ni_np, nm_np, nw_np, pos, ni_np.shape[0],
-            bin_w, bin_h, n_rows, n_cols, hcap, vcap,
-        )
+        # Pin-level routing matches TILOS — closes cong calibration drift.
+        # Falls back to macro-center routing if pin data missing.
+        _pin_tensors = build_pin_route_tensors(benchmark)
+        _use_pin_routing = _pin_tensors is not None
+        if _use_pin_routing:
+            pin_owner_p, pin_mask_p, pin_xoff_p, pin_yoff_p, pin_fx_p, pin_fy_p, nw_p = _pin_tensors
+            macro_to_pin_nets = build_macro_to_pin_nets(benchmark, num_all)
+            num_pin_nets = pin_owner_p.shape[0]
+            _build_pin_hv_route_grid(
+                h_route_grid, v_route_grid,
+                pin_owner_p, pin_mask_p, pin_xoff_p, pin_yoff_p, pin_fx_p, pin_fy_p, nw_p,
+                pos, num_pin_nets, bin_w, bin_h, n_rows, n_cols, hcap, vcap,
+            )
+        else:
+            if _use_pin_routing:
+                _build_pin_hv_route_grid(
+                    h_route_grid, v_route_grid,
+                    pin_owner_p, pin_mask_p, pin_xoff_p, pin_yoff_p, pin_fx_p, pin_fy_p, nw_p,
+                    pos, num_pin_nets, bin_w, bin_h, n_rows, n_cols, hcap, vcap,
+                )
+            else:
+                _build_hv_route_grid(
+                    h_route_grid, v_route_grid, ni_np, nm_np, nw_np, pos, ni_np.shape[0],
+                    bin_w, bin_h, n_rows, n_cols, hcap, vcap,
+                )
         _build_macro_route_grid(
             h_macro_grid, v_macro_grid, pos, sizes, num_hard, bl, br, bb, bt,
             n_rows, n_cols, bin_w, bin_h, hcap, vcap, h_alloc, v_alloc,
         )
         net_hpwl = _hpwl_batch(np.arange(ni_np.shape[0], dtype=np.int32), ni_np, nm_np, pos)
         total_wl = float((net_hpwl * nw_np).sum()) / (num_nets * canvas_norm)
-        current_den = _density_cost_top5(density_grid)
-        current_cong = _hv_congestion_cost_top5(
-            h_route_grid, v_route_grid, h_macro_grid, v_macro_grid, smooth_range
+        use_ire = bool(self.ire_enable)
+        # Density top-10 is already cheap in numba. The incremental win is
+        # maintaining smoothed routing incrementally and avoiding a smoothing
+        # rebuild on every candidate.
+        density_tracker = None
+        cong_tracker = (
+            SmoothHVCostTracker(h_route_grid, v_route_grid, h_macro_grid, v_macro_grid, smooth_range)
+            if use_ire
+            else None
         )
+
+        def read_density_cost() -> float:
+            return density_tracker.cost() if density_tracker is not None else _density_cost_top5(density_grid)
+
+        def read_congestion_cost() -> float:
+            return (
+                cong_tracker.cost()
+                if cong_tracker is not None
+                else _hv_congestion_cost_top5(
+                    h_route_grid, v_route_grid, h_macro_grid, v_macro_grid, smooth_range
+                )
+            )
+
+        def sync_density_tracker(old_density_grid: np.ndarray) -> None:
+            if density_tracker is not None:
+                update_density_tracker_from_diff(density_tracker, old_density_grid, density_grid)
+
+        def sync_route_tracker(old_h_route_grid: np.ndarray, old_v_route_grid: np.ndarray) -> None:
+            if cong_tracker is not None:
+                cong_tracker.apply_route_grid_diff(old_h_route_grid, old_v_route_grid)
+
+        def sync_macro_tracker(old_h_macro_grid: np.ndarray, old_v_macro_grid: np.ndarray) -> None:
+            if cong_tracker is not None:
+                cong_tracker.apply_macro_grid_diff(old_h_macro_grid, old_v_macro_grid)
+
+        def validate_incremental_costs(label: str) -> None:
+            if not self.ire_debug_validate or not use_ire:
+                return
+            den_ref = _density_cost_top5(density_grid)
+            cong_ref = _hv_congestion_cost_top5(
+                h_route_grid, v_route_grid, h_macro_grid, v_macro_grid, smooth_range
+            )
+            den_err = abs(read_density_cost() - den_ref)
+            cong_err = abs(read_congestion_cost() - cong_ref)
+            if den_err > 1e-5 or cong_err > 2e-5:
+                raise RuntimeError(
+                    f"Incremental evaluator drift at {label}: "
+                    f"den_err={den_err:.3e} cong_err={cong_err:.3e}"
+                )
+
+        def apply_density_move(macro_idx: int, from_x: float, from_y: float, to_x: float, to_y: float) -> None:
+            if density_tracker is not None:
+                update_density_incr_tracked(
+                    density_grid, density_tracker, from_x, from_y, to_x, to_y,
+                    hw_np[macro_idx], hh_np[macro_idx],
+                    bl, br, bb, bt, bin_area, n_rows, n_cols, bin_w, bin_h,
+                )
+            else:
+                _update_density_incr(
+                    density_grid, from_x, from_y, to_x, to_y,
+                    hw_np[macro_idx], hh_np[macro_idx],
+                    bl, br, bb, bt, bin_area, n_rows, n_cols, bin_w, bin_h,
+                )
+
+        def apply_macro_route_move(macro_idx: int, from_x: float, from_y: float, to_x: float, to_y: float) -> None:
+            _update_macro_route_incr_single(
+                h_macro_grid, v_macro_grid, from_x, from_y, to_x, to_y,
+                hw_np[macro_idx], hh_np[macro_idx],
+                bl, br, bb, bt, n_rows, n_cols, bin_w, bin_h,
+                hcap, vcap, h_alloc, v_alloc,
+            )
+
+        def apply_route_move(macro_idx: int, aff: np.ndarray, from_x: float, from_y: float) -> None:
+            if _use_pin_routing:
+                pin_aff = macro_to_pin_nets[macro_idx]
+                if len(pin_aff) > 0:
+                    if cong_tracker is not None:
+                        update_pin_hv_route_incr_single_smooth(
+                            h_route_grid, v_route_grid, cong_tracker,
+                            pin_owner_p, pin_mask_p, pin_xoff_p, pin_yoff_p, pin_fx_p, pin_fy_p, nw_p,
+                            pos, pin_aff, macro_idx, from_x, from_y,
+                            bin_w, bin_h, n_rows, n_cols, hcap, vcap,
+                        )
+                    else:
+                        _update_pin_hv_route_incr_single(
+                            h_route_grid, v_route_grid,
+                            pin_owner_p, pin_mask_p, pin_xoff_p, pin_yoff_p, pin_fx_p, pin_fy_p, nw_p,
+                            pos, pin_aff, macro_idx, from_x, from_y,
+                            bin_w, bin_h, n_rows, n_cols, hcap, vcap,
+                        )
+            elif len(aff):
+                if cong_tracker is not None:
+                    update_hv_route_incr_single_smooth(
+                        h_route_grid, v_route_grid, cong_tracker, ni_np, nm_np, nw_np, pos, aff,
+                        macro_idx, from_x, from_y,
+                        bin_w, bin_h, n_rows, n_cols, hcap, vcap,
+                    )
+                else:
+                    _update_hv_route_incr_single(
+                        h_route_grid, v_route_grid, ni_np, nm_np, nw_np, pos, aff,
+                        macro_idx, from_x, from_y,
+                        bin_w, bin_h, n_rows, n_cols, hcap, vcap,
+                    )
+
+        current_den = read_density_cost()
+        current_cong = read_congestion_cost()
 
         # Calibrate fast surrogate against real proxy (recalibrated on every
         # successful checkpoint to track drift).
@@ -791,7 +991,7 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
 
         if self.verbose:
             print(
-                f"Channel relocate start: proxy={best_proxy:.4f} "
+                f"Hard channel start: proxy={best_proxy:.4f} "
                 f"wl={best_metrics['wirelength_cost']:.4f} "
                 f"den={best_metrics['density_cost']:.4f} "
                 f"cong={best_metrics['congestion_cost']:.4f} "
@@ -889,6 +1089,7 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
 
         def rebuild_fast_state(from_tensor: torch.Tensor) -> None:
             nonlocal pos, net_hpwl, total_wl, current_den, current_cong, current_proxy
+            nonlocal density_tracker, cong_tracker
             pos = from_tensor.detach().numpy().copy()
             density_grid[:] = 0
             h_route_grid[:] = 0
@@ -899,20 +1100,30 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
                 density_grid, pos, sizes, num_all, bl, br, bb, bt, bin_area,
                 n_rows, n_cols, bin_w, bin_h,
             )
-            _build_hv_route_grid(
-                h_route_grid, v_route_grid, ni_np, nm_np, nw_np, pos, ni_np.shape[0],
-                bin_w, bin_h, n_rows, n_cols, hcap, vcap,
-            )
+            if _use_pin_routing:
+                _build_pin_hv_route_grid(
+                    h_route_grid, v_route_grid,
+                    pin_owner_p, pin_mask_p, pin_xoff_p, pin_yoff_p, pin_fx_p, pin_fy_p, nw_p,
+                    pos, num_pin_nets, bin_w, bin_h, n_rows, n_cols, hcap, vcap,
+                )
+            else:
+                _build_hv_route_grid(
+                    h_route_grid, v_route_grid, ni_np, nm_np, nw_np, pos, ni_np.shape[0],
+                    bin_w, bin_h, n_rows, n_cols, hcap, vcap,
+                )
             _build_macro_route_grid(
                 h_macro_grid, v_macro_grid, pos, sizes, num_hard, bl, br, bb, bt,
                 n_rows, n_cols, bin_w, bin_h, hcap, vcap, h_alloc, v_alloc,
             )
             net_hpwl = _hpwl_batch(np.arange(ni_np.shape[0], dtype=np.int32), ni_np, nm_np, pos)
             total_wl = float((net_hpwl * nw_np).sum()) / (num_nets * canvas_norm)
-            current_den = _density_cost_top5(density_grid)
-            current_cong = _hv_congestion_cost_top5(
-                h_route_grid, v_route_grid, h_macro_grid, v_macro_grid, smooth_range
-            )
+            if use_ire:
+                density_tracker = None
+                cong_tracker = SmoothHVCostTracker(
+                    h_route_grid, v_route_grid, h_macro_grid, v_macro_grid, smooth_range
+                )
+            current_den = read_density_cost()
+            current_cong = read_congestion_cost()
             current_proxy = (
                 total_wl * wl_scale
                 + 0.5 * current_den * den_scale
@@ -929,11 +1140,15 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
         score_grid = make_pressure_score()
         span = benchmark.canvas_width + benchmark.canvas_height
         stop_reason = "budget"
-        # ProgressGate: adaptive momentum-based early stop. Improvements
-        # build patience; non-improvements drain it. Replaces the fixed
-        # stale_checkpoints counter with a self-tuning version.
-        gate = ProgressGate(base_patience=4, bonus_per_gain=2, max_patience=12)
-        gate.best = best_proxy
+        # Windowed gate: raw checkpoints bounce, so stop only after whole
+        # windows fail to improve the best real proxy.
+        gate = WindowProgressGate(
+            window=3,
+            patience_windows=1,
+            epsilon=0.001,
+            min_time=min(45.0, max(0.0, float(budget))),
+            initial_best=best_proxy,
+        )
 
         while (
             time() - t0 < budget
@@ -1043,23 +1258,10 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
                     # ── Apply move incrementally ──
                     pos[macro_idx, 0] = x
                     pos[macro_idx, 1] = y
-                    _update_density_incr(
-                        density_grid, old_x, old_y, x, y,
-                        hw_np[macro_idx], hh_np[macro_idx],
-                        bl, br, bb, bt, bin_area, n_rows, n_cols, bin_w, bin_h,
-                    )
-                    _update_macro_route_incr_single(
-                        h_macro_grid, v_macro_grid, old_x, old_y, x, y,
-                        hw_np[macro_idx], hh_np[macro_idx],
-                        bl, br, bb, bt, n_rows, n_cols, bin_w, bin_h,
-                        hcap, vcap, h_alloc, v_alloc,
-                    )
+                    apply_density_move(macro_idx, old_x, old_y, x, y)
+                    apply_macro_route_move(macro_idx, old_x, old_y, x, y)
+                    apply_route_move(macro_idx, aff, old_x, old_y)
                     if len(aff):
-                        _update_hv_route_incr_single(
-                            h_route_grid, v_route_grid, ni_np, nm_np, nw_np, pos, aff,
-                            macro_idx, old_x, old_y,
-                            bin_w, bin_h, n_rows, n_cols, hcap, vcap,
-                        )
                         new_hpwl = _hpwl_batch(aff, ni_np, nm_np, pos)
                         wl_delta = float(((new_hpwl - old_hpwl) * nw_np[aff]).sum()) / (
                             num_nets * canvas_norm
@@ -1067,10 +1269,9 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
                     else:
                         new_hpwl = old_hpwl
                         wl_delta = 0.0
-                    new_den = _density_cost_top5(density_grid)
-                    new_cong = _hv_congestion_cost_top5(
-                        h_route_grid, v_route_grid, h_macro_grid, v_macro_grid, smooth_range
-                    )
+                    new_den = read_density_cost()
+                    new_cong = read_congestion_cost()
+                    validate_incremental_costs("hard-trial-apply")
                     proxy = (
                         (total_wl + wl_delta) * wl_scale
                         + 0.5 * new_den * den_scale
@@ -1081,23 +1282,10 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
                     # ── Always revert; only commit local_best below ──
                     pos[macro_idx, 0] = old_x
                     pos[macro_idx, 1] = old_y
-                    _update_density_incr(
-                        density_grid, x, y, old_x, old_y,
-                        hw_np[macro_idx], hh_np[macro_idx],
-                        bl, br, bb, bt, bin_area, n_rows, n_cols, bin_w, bin_h,
-                    )
-                    _update_macro_route_incr_single(
-                        h_macro_grid, v_macro_grid, x, y, old_x, old_y,
-                        hw_np[macro_idx], hh_np[macro_idx],
-                        bl, br, bb, bt, n_rows, n_cols, bin_w, bin_h,
-                        hcap, vcap, h_alloc, v_alloc,
-                    )
-                    if len(aff):
-                        _update_hv_route_incr_single(
-                            h_route_grid, v_route_grid, ni_np, nm_np, nw_np, pos, aff,
-                            macro_idx, x, y,
-                            bin_w, bin_h, n_rows, n_cols, hcap, vcap,
-                        )
+                    apply_density_move(macro_idx, x, y, old_x, old_y)
+                    apply_macro_route_move(macro_idx, x, y, old_x, old_y)
+                    apply_route_move(macro_idx, aff, x, y)
+                    validate_incremental_costs("hard-trial-revert")
 
                     pressure_bonus = min(0.003, max(0.0, pressure_drop) * (0.00035 * stale_level))
                     selection_score = proxy - pressure_bonus
@@ -1115,23 +1303,11 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
                     pos[macro_idx, 1] = y
                     cur[macro_idx, 0] = x
                     cur[macro_idx, 1] = y
-                    _update_density_incr(
-                        density_grid, old_x, old_y, x, y,
-                        hw_np[macro_idx], hh_np[macro_idx],
-                        bl, br, bb, bt, bin_area, n_rows, n_cols, bin_w, bin_h,
-                    )
-                    _update_macro_route_incr_single(
-                        h_macro_grid, v_macro_grid, old_x, old_y, x, y,
-                        hw_np[macro_idx], hh_np[macro_idx],
-                        bl, br, bb, bt, n_rows, n_cols, bin_w, bin_h,
-                        hcap, vcap, h_alloc, v_alloc,
-                    )
+                    apply_density_move(macro_idx, old_x, old_y, x, y)
+                    apply_macro_route_move(macro_idx, old_x, old_y, x, y)
+                    apply_route_move(macro_idx, aff, old_x, old_y)
+                    validate_incremental_costs("hard-commit")
                     if len(aff):
-                        _update_hv_route_incr_single(
-                            h_route_grid, v_route_grid, ni_np, nm_np, nw_np, pos, aff,
-                            macro_idx, old_x, old_y,
-                            bin_w, bin_h, n_rows, n_cols, hcap, vcap,
-                        )
                         net_hpwl[aff] = new_hpwl
                     total_wl += wl_delta
                     current_den = new_den
@@ -1162,7 +1338,7 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
                             )
                         checkpoint_accepts = 0
                         last_checkpoint_t = time()
-                        improved, should_stop = gate.update(real_proxy)
+                        improved, should_stop = gate.update(real_proxy, time() - t0)
                         if improved:
                             best_proxy = real_proxy
                             best = cur.clone()
@@ -1186,7 +1362,7 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
                             if should_stop:
                                 stop_reason = f"progress_gate (best={gate.best:.4f})"
                                 if self.verbose:
-                                    print("Channel relocate stalled (progress gate)")
+                                    print("Hard channel stalled (progress gate)")
                                 break
 
             if moved_this_sweep == 0:
@@ -1217,7 +1393,7 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
 
         if self.verbose:
             print(
-                f"Channel relocate done: accepts={accepts} fast_evals={fast_evals} "
+                f"Hard channel done: accepts={accepts} fast_evals={fast_evals} "
                 f"real_evals={real_evals} best proxy={best_proxy:.4f} stop={stop_reason}"
             )
         return best
@@ -1317,20 +1493,128 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
             density_grid, pos, sizes, num_all, bl, br, bb, bt, bin_area,
             n_rows, n_cols, bin_w, bin_h,
         )
-        _build_hv_route_grid(
-            h_route_grid, v_route_grid, ni_np, nm_np, nw_np, pos, ni_np.shape[0],
-            bin_w, bin_h, n_rows, n_cols, hcap, vcap,
-        )
+        # Pin-level routing matches TILOS — closes cong calibration drift.
+        # Falls back to macro-center routing if pin data missing.
+        _pin_tensors = build_pin_route_tensors(benchmark)
+        _use_pin_routing = _pin_tensors is not None
+        if _use_pin_routing:
+            pin_owner_p, pin_mask_p, pin_xoff_p, pin_yoff_p, pin_fx_p, pin_fy_p, nw_p = _pin_tensors
+            macro_to_pin_nets = build_macro_to_pin_nets(benchmark, num_all)
+            num_pin_nets = pin_owner_p.shape[0]
+            _build_pin_hv_route_grid(
+                h_route_grid, v_route_grid,
+                pin_owner_p, pin_mask_p, pin_xoff_p, pin_yoff_p, pin_fx_p, pin_fy_p, nw_p,
+                pos, num_pin_nets, bin_w, bin_h, n_rows, n_cols, hcap, vcap,
+            )
+        else:
+            if _use_pin_routing:
+                _build_pin_hv_route_grid(
+                    h_route_grid, v_route_grid,
+                    pin_owner_p, pin_mask_p, pin_xoff_p, pin_yoff_p, pin_fx_p, pin_fy_p, nw_p,
+                    pos, num_pin_nets, bin_w, bin_h, n_rows, n_cols, hcap, vcap,
+                )
+            else:
+                _build_hv_route_grid(
+                    h_route_grid, v_route_grid, ni_np, nm_np, nw_np, pos, ni_np.shape[0],
+                    bin_w, bin_h, n_rows, n_cols, hcap, vcap,
+                )
         _build_macro_route_grid(
             h_macro_grid, v_macro_grid, pos, sizes, num_hard, bl, br, bb, bt,
             n_rows, n_cols, bin_w, bin_h, hcap, vcap, h_alloc, v_alloc,
         )
         net_hpwl = _hpwl_batch(np.arange(ni_np.shape[0], dtype=np.int32), ni_np, nm_np, pos)
         total_wl = float((net_hpwl * nw_np).sum()) / (num_nets * canvas_norm)
-        current_den = _density_cost_top5(density_grid)
-        current_cong = _hv_congestion_cost_top5(
-            h_route_grid, v_route_grid, h_macro_grid, v_macro_grid, smooth_range
+        use_ire = bool(self.ire_enable)
+        density_tracker = None
+        cong_tracker = (
+            SmoothHVCostTracker(h_route_grid, v_route_grid, h_macro_grid, v_macro_grid, smooth_range)
+            if use_ire
+            else None
         )
+
+        def read_density_cost() -> float:
+            return density_tracker.cost() if density_tracker is not None else _density_cost_top5(density_grid)
+
+        def read_congestion_cost() -> float:
+            return (
+                cong_tracker.cost()
+                if cong_tracker is not None
+                else _hv_congestion_cost_top5(
+                    h_route_grid, v_route_grid, h_macro_grid, v_macro_grid, smooth_range
+                )
+            )
+
+        def sync_density_tracker(old_density_grid: np.ndarray) -> None:
+            if density_tracker is not None:
+                update_density_tracker_from_diff(density_tracker, old_density_grid, density_grid)
+
+        def sync_route_tracker(old_h_route_grid: np.ndarray, old_v_route_grid: np.ndarray) -> None:
+            if cong_tracker is not None:
+                cong_tracker.apply_route_grid_diff(old_h_route_grid, old_v_route_grid)
+
+        def validate_incremental_costs(label: str) -> None:
+            if not self.ire_debug_validate or not use_ire:
+                return
+            den_ref = _density_cost_top5(density_grid)
+            cong_ref = _hv_congestion_cost_top5(
+                h_route_grid, v_route_grid, h_macro_grid, v_macro_grid, smooth_range
+            )
+            den_err = abs(read_density_cost() - den_ref)
+            cong_err = abs(read_congestion_cost() - cong_ref)
+            if den_err > 1e-5 or cong_err > 2e-5:
+                raise RuntimeError(
+                    f"Incremental evaluator drift at {label}: "
+                    f"den_err={den_err:.3e} cong_err={cong_err:.3e}"
+                )
+
+        def apply_density_move(macro_idx: int, from_x: float, from_y: float, to_x: float, to_y: float) -> None:
+            if density_tracker is not None:
+                update_density_incr_tracked(
+                    density_grid, density_tracker, from_x, from_y, to_x, to_y,
+                    hw_np[macro_idx], hh_np[macro_idx],
+                    bl, br, bb, bt, bin_area, n_rows, n_cols, bin_w, bin_h,
+                )
+            else:
+                _update_density_incr(
+                    density_grid, from_x, from_y, to_x, to_y,
+                    hw_np[macro_idx], hh_np[macro_idx],
+                    bl, br, bb, bt, bin_area, n_rows, n_cols, bin_w, bin_h,
+                )
+
+        def apply_route_move(macro_idx: int, aff: np.ndarray, from_x: float, from_y: float) -> None:
+            if _use_pin_routing:
+                pin_aff = macro_to_pin_nets[macro_idx]
+                if len(pin_aff) > 0:
+                    if cong_tracker is not None:
+                        update_pin_hv_route_incr_single_smooth(
+                            h_route_grid, v_route_grid, cong_tracker,
+                            pin_owner_p, pin_mask_p, pin_xoff_p, pin_yoff_p, pin_fx_p, pin_fy_p, nw_p,
+                            pos, pin_aff, macro_idx, from_x, from_y,
+                            bin_w, bin_h, n_rows, n_cols, hcap, vcap,
+                        )
+                    else:
+                        _update_pin_hv_route_incr_single(
+                            h_route_grid, v_route_grid,
+                            pin_owner_p, pin_mask_p, pin_xoff_p, pin_yoff_p, pin_fx_p, pin_fy_p, nw_p,
+                            pos, pin_aff, macro_idx, from_x, from_y,
+                            bin_w, bin_h, n_rows, n_cols, hcap, vcap,
+                        )
+            elif len(aff):
+                if cong_tracker is not None:
+                    update_hv_route_incr_single_smooth(
+                        h_route_grid, v_route_grid, cong_tracker, ni_np, nm_np, nw_np, pos, aff,
+                        macro_idx, from_x, from_y,
+                        bin_w, bin_h, n_rows, n_cols, hcap, vcap,
+                    )
+                else:
+                    _update_hv_route_incr_single(
+                        h_route_grid, v_route_grid, ni_np, nm_np, nw_np, pos, aff,
+                        macro_idx, from_x, from_y,
+                        bin_w, bin_h, n_rows, n_cols, hcap, vcap,
+                    )
+
+        current_den = read_density_cost()
+        current_cong = read_congestion_cost()
         wl_scale = best_metrics["wirelength_cost"] / (total_wl + 1e-8)
         den_scale = best_metrics["density_cost"] / (current_den + 1e-8)
         cong_scale = best_metrics["congestion_cost"] / (current_cong + 1e-8)
@@ -1342,7 +1626,7 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
 
         if self.verbose:
             print(
-                f"Soft channel relocate start: proxy={best_proxy:.4f} "
+                f"Soft channel start: proxy={best_proxy:.4f} "
                 f"wl={best_metrics['wirelength_cost']:.4f} "
                 f"den={best_metrics['density_cost']:.4f} "
                 f"cong={best_metrics['congestion_cost']:.4f} "
@@ -1379,6 +1663,7 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
 
         def rebuild_fast_state(from_tensor: torch.Tensor) -> None:
             nonlocal pos, net_hpwl, total_wl, current_den, current_cong, current_proxy
+            nonlocal density_tracker, cong_tracker
             pos = from_tensor.detach().numpy().copy()
             density_grid[:] = 0
             h_route_grid[:] = 0
@@ -1388,16 +1673,26 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
                 density_grid, pos, sizes, num_all, bl, br, bb, bt, bin_area,
                 n_rows, n_cols, bin_w, bin_h,
             )
-            _build_hv_route_grid(
-                h_route_grid, v_route_grid, ni_np, nm_np, nw_np, pos, ni_np.shape[0],
-                bin_w, bin_h, n_rows, n_cols, hcap, vcap,
-            )
+            if _use_pin_routing:
+                _build_pin_hv_route_grid(
+                    h_route_grid, v_route_grid,
+                    pin_owner_p, pin_mask_p, pin_xoff_p, pin_yoff_p, pin_fx_p, pin_fy_p, nw_p,
+                    pos, num_pin_nets, bin_w, bin_h, n_rows, n_cols, hcap, vcap,
+                )
+            else:
+                _build_hv_route_grid(
+                    h_route_grid, v_route_grid, ni_np, nm_np, nw_np, pos, ni_np.shape[0],
+                    bin_w, bin_h, n_rows, n_cols, hcap, vcap,
+                )
             net_hpwl = _hpwl_batch(np.arange(ni_np.shape[0], dtype=np.int32), ni_np, nm_np, pos)
             total_wl = float((net_hpwl * nw_np).sum()) / (num_nets * canvas_norm)
-            current_den = _density_cost_top5(density_grid)
-            current_cong = _hv_congestion_cost_top5(
-                h_route_grid, v_route_grid, h_macro_grid, v_macro_grid, smooth_range
-            )
+            if use_ire:
+                density_tracker = None
+                cong_tracker = SmoothHVCostTracker(
+                    h_route_grid, v_route_grid, h_macro_grid, v_macro_grid, smooth_range
+                )
+            current_den = read_density_cost()
+            current_cong = read_congestion_cost()
             current_proxy = (
                 total_wl * wl_scale
                 + 0.5 * current_den * den_scale
@@ -1564,17 +1859,9 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
                     # Apply move incrementally (density + HV routing only).
                     pos[macro_idx, 0] = x
                     pos[macro_idx, 1] = y
-                    _update_density_incr(
-                        density_grid, old_x, old_y, x, y,
-                        hw_np[macro_idx], hh_np[macro_idx],
-                        bl, br, bb, bt, bin_area, n_rows, n_cols, bin_w, bin_h,
-                    )
+                    apply_density_move(macro_idx, old_x, old_y, x, y)
+                    apply_route_move(macro_idx, aff, old_x, old_y)
                     if len(aff):
-                        _update_hv_route_incr_single(
-                            h_route_grid, v_route_grid, ni_np, nm_np, nw_np, pos, aff,
-                            macro_idx, old_x, old_y,
-                            bin_w, bin_h, n_rows, n_cols, hcap, vcap,
-                        )
                         new_hpwl = _hpwl_batch(aff, ni_np, nm_np, pos)
                         wl_delta = float(((new_hpwl - old_hpwl) * nw_np[aff]).sum()) / (
                             num_nets * canvas_norm
@@ -1582,10 +1869,9 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
                     else:
                         new_hpwl = old_hpwl
                         wl_delta = 0.0
-                    new_den = _density_cost_top5(density_grid)
-                    new_cong = _hv_congestion_cost_top5(
-                        h_route_grid, v_route_grid, h_macro_grid, v_macro_grid, smooth_range
-                    )
+                    new_den = read_density_cost()
+                    new_cong = read_congestion_cost()
+                    validate_incremental_costs("soft-trial-apply")
                     proxy = (
                         (total_wl + wl_delta) * wl_scale
                         + 0.5 * new_den * den_scale
@@ -1596,17 +1882,9 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
                     # Always revert; only commit local_best below.
                     pos[macro_idx, 0] = old_x
                     pos[macro_idx, 1] = old_y
-                    _update_density_incr(
-                        density_grid, x, y, old_x, old_y,
-                        hw_np[macro_idx], hh_np[macro_idx],
-                        bl, br, bb, bt, bin_area, n_rows, n_cols, bin_w, bin_h,
-                    )
-                    if len(aff):
-                        _update_hv_route_incr_single(
-                            h_route_grid, v_route_grid, ni_np, nm_np, nw_np, pos, aff,
-                            macro_idx, x, y,
-                            bin_w, bin_h, n_rows, n_cols, hcap, vcap,
-                        )
+                    apply_density_move(macro_idx, x, y, old_x, old_y)
+                    apply_route_move(macro_idx, aff, x, y)
+                    validate_incremental_costs("soft-trial-revert")
 
                     pressure_bonus = min(0.003, max(0.0, pressure_drop) * (0.00035 * stale_level))
                     selection_score = proxy - pressure_bonus
@@ -1623,17 +1901,10 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
                     pos[macro_idx, 1] = y
                     cur[macro_idx, 0] = x
                     cur[macro_idx, 1] = y
-                    _update_density_incr(
-                        density_grid, old_x, old_y, x, y,
-                        hw_np[macro_idx], hh_np[macro_idx],
-                        bl, br, bb, bt, bin_area, n_rows, n_cols, bin_w, bin_h,
-                    )
+                    apply_density_move(macro_idx, old_x, old_y, x, y)
+                    apply_route_move(macro_idx, aff, old_x, old_y)
+                    validate_incremental_costs("soft-commit")
                     if len(aff):
-                        _update_hv_route_incr_single(
-                            h_route_grid, v_route_grid, ni_np, nm_np, nw_np, pos, aff,
-                            macro_idx, old_x, old_y,
-                            bin_w, bin_h, n_rows, n_cols, hcap, vcap,
-                        )
                         net_hpwl[aff] = new_hpwl
                     total_wl += wl_delta
                     current_den = new_den
@@ -1686,7 +1957,7 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
                             if should_stop:
                                 stop_reason = f"progress_gate(best={gate.best:.4f})"
                                 if self.verbose:
-                                    print("Soft channel relocate stalled (progress gate)")
+                                    print("Soft channel stalled (progress gate)")
                                 break
 
             if moved_this_sweep == 0:
@@ -1716,7 +1987,7 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
 
         if self.verbose:
             print(
-                f"Soft channel relocate done: accepts={accepts} fast_evals={fast_evals} "
+                f"Soft channel done: accepts={accepts} fast_evals={fast_evals} "
                 f"real_evals={real_evals} best proxy={best_proxy:.4f} stop={stop_reason}"
             )
         return best
@@ -1953,8 +2224,8 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
     def _apply_init_strategy(self, benchmark: Benchmark) -> Benchmark:
         """Replace benchmark.macro_positions per init_strategy. Returns the
         (possibly modified) benchmark. Does NOT mutate the original."""
-        if self.init_strategy == "ibm":
-            return benchmark  # use the default IBM 2004 floorplan as-is
+        if self.init_strategy in ("provided", "initial"):
+            return benchmark  # use the benchmark-provided initial placement as-is
 
         import copy
         bench = copy.copy(benchmark)
@@ -1967,13 +2238,24 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
         canvas_w = benchmark.canvas_width
         canvas_h = benchmark.canvas_height
         gen = torch.Generator().manual_seed(self.seed)
+        torch.manual_seed(self.seed)
+        movable_all = ~benchmark.macro_fixed
 
         if self.init_strategy == "spectral":
             from submissions.hybrid_analytical_placer import spectral_init_placement
             nets_list = [net.tolist() for net in benchmark.net_nodes if len(net) >= 2]
             bench.macro_positions = spectral_init_placement(
-                bench.macro_positions, benchmark, nets_list, blend=0.7,
+                bench.macro_positions, benchmark, nets_list,
+                blend=self.init_spectral_blend,
             )
+            if self.init_spectral_flip_x:
+                bench.macro_positions[movable_all, 0] = (
+                    canvas_w - bench.macro_positions[movable_all, 0]
+                )
+            if self.init_spectral_flip_y:
+                bench.macro_positions[movable_all, 1] = (
+                    canvas_h - bench.macro_positions[movable_all, 1]
+                )
         elif self.init_strategy == "perturbed":
             sigma_x = self.init_perturb_sigma * canvas_w
             sigma_y = self.init_perturb_sigma * canvas_h
@@ -1981,6 +2263,25 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
             noise[:, 0].normal_(0.0, sigma_x, generator=gen)
             noise[:, 1].normal_(0.0, sigma_y, generator=gen)
             bench.macro_positions = bench.macro_positions + noise
+        elif self.init_strategy == "halton":
+            def vdc(index: int, base: int) -> float:
+                denom = 1.0
+                value = 0.0
+                while index:
+                    index, rem = divmod(index, base)
+                    denom *= base
+                    value += rem / denom
+                return value
+
+            movable_idx = torch.where(movable_all)[0]
+            area = (sizes[movable_idx, 0] * sizes[movable_idx, 1]).cpu().numpy()
+            order_np = np.argsort(-area)
+            seed_offset = 17 + (self.seed % 1009)
+            for rank, local_i in enumerate(order_np):
+                i = int(movable_idx[int(local_i)])
+                h = seed_offset + rank + 1
+                bench.macro_positions[i, 0] = hw[i] + vdc(h, 2) * max(1e-6, canvas_w - 2 * hw[i])
+                bench.macro_positions[i, 1] = hh[i] + vdc(h, 3) * max(1e-6, canvas_h - 2 * hh[i])
         elif self.init_strategy == "random":
             n = num_all
             bench.macro_positions = torch.empty_like(bench.macro_positions)
@@ -1988,6 +2289,14 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
             bench.macro_positions[:, 1].uniform_(0.0, canvas_h, generator=gen)
         else:
             raise ValueError(f"unknown init_strategy: {self.init_strategy}")
+
+        if self.init_jitter_sigma > 0.0:
+            sigma_x = self.init_jitter_sigma * canvas_w
+            sigma_y = self.init_jitter_sigma * canvas_h
+            jitter = torch.empty_like(bench.macro_positions)
+            jitter[:, 0].normal_(0.0, sigma_x, generator=gen)
+            jitter[:, 1].normal_(0.0, sigma_y, generator=gen)
+            bench.macro_positions[movable_all] += jitter[movable_all]
 
         # Clamp to canvas bounds (per-macro size). Fixed macros stay put.
         bench.macro_positions[:, 0] = torch.clamp(
@@ -1998,8 +2307,17 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
         )
         if benchmark.macro_fixed.any():
             bench.macro_positions[benchmark.macro_fixed] = benchmark.macro_positions[benchmark.macro_fixed]
-        if self.verbose:
-            print(f"[init] applied strategy '{self.init_strategy}' (seed={self.seed})")
+        if self.verbose and self.init_strategy not in ("provided", "initial"):
+            detail = ""
+            if self.init_strategy == "perturbed":
+                detail = f" sigma={self.init_perturb_sigma:.3f}"
+            elif self.init_strategy == "spectral":
+                detail = (
+                    f" blend={self.init_spectral_blend:.2f}"
+                    f" flip=({int(self.init_spectral_flip_x)},{int(self.init_spectral_flip_y)})"
+                    f" jitter={self.init_jitter_sigma:.3f}"
+                )
+            print(f"[init] applied strategy '{self.init_strategy}' (seed={self.seed}{detail})")
         return bench
 
     def place(self, benchmark: Benchmark) -> torch.Tensor:
@@ -2035,28 +2353,33 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
             net_indices, net_mask, net_weights, canvas_norm,
             budget=self.ch_budget,
         )
-        self._save_v2_stage(plc, benchmark, refined, "08_channel")
+        self._save_v2_stage(plc, benchmark, refined, "10_hard_channel")
 
-        # Soft channel relocate: long-range moves for soft macros to
-        # escape the post-Nesterov basin and clear wire-nests.
-        soft_relocated = self._soft_channel_relocate(
-            refined, benchmark, plc, nets,
-            net_indices, net_mask, net_weights, canvas_norm,
-            budget=self.sch_budget,
-        )
-        self._save_v2_stage(plc, benchmark, soft_relocated, "09_soft_channel")
+        # Soft channel relocate is opt-in. It measured as a tiny gain on
+        # only a couple of sweep benches, so default runs skip it.
+        soft_relocated = refined
+        if self.sch_enable:
+            soft_relocated = self._soft_channel_relocate(
+                refined, benchmark, plc, nets,
+                net_indices, net_mask, net_weights, canvas_norm,
+                budget=self.sch_budget,
+            )
+            self._save_v2_stage(plc, benchmark, soft_relocated, "11_soft_channel")
 
-        # Post-channel constrained Nesterov polish: final gradient settle
-        # with congestion-awareness for both hard (tethered) and soft.
-        polished = self._post_channel_polish(
-            soft_relocated, benchmark, plc, nets,
-            net_indices, net_mask, net_weights, canvas_norm,
-        )
-        self._save_v2_stage(plc, benchmark, polished, "10_polish")
+        # Post-channel polish is opt-in. The current incremental-real-eval
+        # logs show it consistently restores the incoming checkpoint, so the
+        # default submission path spends this time elsewhere.
+        polished = soft_relocated
+        if self.polish_enable:
+            polished = self._post_channel_polish(
+                soft_relocated, benchmark, plc, nets,
+                net_indices, net_mask, net_weights, canvas_norm,
+            )
+            self._save_v2_stage(plc, benchmark, polished, "12_polish")
 
         # Safety: ensure no overlaps slipped through either stage.
         if self._hard_overlap_count(polished, benchmark) > 0:
-            print("[v2] polish left overlaps, legalizing")
+            print("[v2] final v2 placement has overlaps, legalizing")
             polished = self._legalize_fast(polished, benchmark, gap=0.01, max_iters=400)
             if self._hard_overlap_count(polished, benchmark) > 0:
                 polished = strong_legalize(polished, benchmark, gap=0.02, max_iters=80)
@@ -2066,7 +2389,7 @@ class HybridAnalyticalPlacerV2(HybridAnalyticalPlacer):
         if not self.enable_plots:
             return
         try:
-            vis_dir = Path("vis") / benchmark.name
+            vis_dir = Path(os.environ.get("HAP_VIS_DIR", "vis")) / benchmark.name
             vis_dir.mkdir(parents=True, exist_ok=True)
             from macro_place.utils import visualize_placement
             _set_placement(plc, placement.detach(), benchmark)

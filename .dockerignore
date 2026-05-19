@@ -1,9 +1,25 @@
 # Docker build context exclusions for eval_docker/
 .git/
+.DS_Store
+.pytest_cache/
+.uv-cache/
+.venv/
+__pycache__/
+**/__pycache__/
 submissions_eval/
 assets/
 benchmarks/processed/
 eval_docker/results/
+ab_logs/
+ab_vis/
+logs/
+multi_runs/
+prev-vis/
+prev_logs/
+runlogs/
+saved_logs/
+vis/
+*.log
 *.gif
 *.png
 os_debug.txt

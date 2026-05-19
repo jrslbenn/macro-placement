@@ -1,5 +1,5 @@
 """
-Canonical entry point for the SPIRAL Placer submission.
+Canonical entry point for the HAPpy Placer submission.
 
 The competition eval expects a `Placer` class with a `place(benchmark)` method.
 This thin shim re-exports the full pipeline implemented in
@@ -26,6 +26,33 @@ _spec.loader.exec_module(_mod)
 HybridAnalyticalPlacerV2 = _mod.HybridAnalyticalPlacerV2
 
 
-class Placer(HybridAnalyticalPlacerV2):
-    """SPIRAL Placer — pipeline detailed in README.md."""
-    pass
+def _env_enabled(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() not in ("", "0", "false", "no", "off")
+
+
+if _env_enabled("HAP_MULTI"):
+    _MULTI_PATH = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "submissions",
+        "hybridv2_multi.py",
+    )
+    _multi_spec = importlib.util.spec_from_file_location("_hv2_multi_impl", _MULTI_PATH)
+    _multi_mod = importlib.util.module_from_spec(_multi_spec)
+    _multi_spec.loader.exec_module(_multi_mod)
+
+    HybridAnalyticalPlacerV2Multi = _multi_mod.HybridAnalyticalPlacerV2Multi
+
+    class Placer(HybridAnalyticalPlacerV2Multi):
+        """HAPpy Placer multi-start wrapper, enabled by HAP_MULTI=1."""
+
+        def __init__(self):
+            super().__init__(
+                num_steps=int(os.environ.get("HAP_MULTI_NUM_STEPS", "50000")),
+                threads_per_worker=int(os.environ.get("HAP_MULTI_THREADS", "2")),
+            )
+
+else:
+
+    class Placer(HybridAnalyticalPlacerV2):
+        """HAPpy Placer — pipeline detailed in README.md."""
+        pass
