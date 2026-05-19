@@ -1,6 +1,13 @@
-FROM pytorch/pytorch:2.3.0-cuda12.1-cudnn8-runtime
+FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
 
-RUN pip install --no-cache-dir numba scipy matplotlib tqdm absl-py
+ENV PYTHONUNBUFFERED=1 \
+    HAP_MULTI=1 \
+    HAP_MULTI_SET=provided4 \
+    HAP_MULTI_THREADS=3 \
+    HAP_MULTI_WORKER_TIMEOUT=3200 \
+    OMP_NUM_THREADS=3 \
+    MKL_NUM_THREADS=3 \
+    NUMBA_NUM_THREADS=3
 
 WORKDIR /app
 COPY . .

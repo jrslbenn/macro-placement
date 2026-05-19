@@ -48,7 +48,7 @@ if _env_enabled("HAP_MULTI"):
         def __init__(self):
             super().__init__(
                 num_steps=int(os.environ.get("HAP_MULTI_NUM_STEPS", "50000")),
-                threads_per_worker=int(os.environ.get("HAP_MULTI_THREADS", "2")),
+                threads_per_worker=int(os.environ.get("HAP_MULTI_THREADS", "3")),
             )
 
 else:

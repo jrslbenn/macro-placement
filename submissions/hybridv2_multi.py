@@ -127,6 +127,27 @@ class HybridAnalyticalPlacerV2Multi:
         # Tier-1 benchmark name.
         repo_root = Path(__file__).resolve().parent.parent
         bench_dir = repo_root / "external" / "MacroPlacement" / "Testcases" / "ICCAD04" / benchmark.name
+        if not bench_dir.exists():
+            # The forked workers need a benchmark directory so they can reload
+            # the plc object. For benchmarks that are handed to us only as an
+            # in-memory Benchmark object, fall back to the single-process placer
+            # rather than failing the submission.
+            if self.verbose:
+                print(
+                    f"[multi] reload dir missing for '{benchmark.name}' "
+                    f"({bench_dir}); falling back to single run"
+                )
+            from submissions.hybridv2 import HybridAnalyticalPlacerV2
+
+            placer = HybridAnalyticalPlacerV2(
+                seed=self.seed,
+                num_steps=self.num_steps,
+                verbose=self.verbose,
+                enable_plots=self.enable_plots,
+                init_strategy="provided",
+            )
+            return placer.place(benchmark)
+
         run_root = (
             Path(os.environ.get("HAP_MULTI_OUT_DIR", "multi_runs"))
             / benchmark.name

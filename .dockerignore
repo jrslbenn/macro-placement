@@ -14,10 +14,13 @@ ab_logs/
 ab_vis/
 logs/
 multi_runs/
+multi_seed_runs/
 prev-vis/
 prev_logs/
 runlogs/
 saved_logs/
+sweep_1_11_logs/
+sweep_1_11_vis/
 vis/
 *.log
 *.gif
