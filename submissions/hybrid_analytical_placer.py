@@ -1407,8 +1407,8 @@ class HybridAnalyticalPlacer:
             top_k_candidates.append((initial_proxy, -1, placement.detach().clone()))
 
         start_time = time()
-        total_time_budget = 3000
-        hard_time_budget = 3000
+        total_time_budget = float(os.environ.get("HAP_TOTAL_TIME_BUDGET", "3000"))
+        hard_time_budget = float(os.environ.get("HAP_HARD_TIME_BUDGET", str(total_time_budget)))
         min_stage_budget = 120
         nesterov_time_budget = 300
         skip_nesterov = os.environ.get("HAP_SKIP_NESTEROV", "").strip().lower() not in (
@@ -6491,12 +6491,30 @@ class HybridAnalyticalPlacer:
         check_interval = 500_000
         last_check_accepts = 0
         min_rate = 5e-5
+        long_soft_displace = float(budget) >= 900.0
+        gate_window = int(os.environ.get(
+            "HAP_SOFT_DISPLACE_GATE_WINDOW",
+            "3" if long_soft_displace else "4",
+        ))
+        gate_patience = int(os.environ.get(
+            "HAP_SOFT_DISPLACE_GATE_PATIENCE",
+            "1" if long_soft_displace else "2",
+        ))
+        gate_epsilon = float(os.environ.get(
+            "HAP_SOFT_DISPLACE_GATE_EPS",
+            "0.0020" if long_soft_displace else "0.0010",
+        ))
+        gate_min_time = float(os.environ.get("HAP_SOFT_DISPLACE_GATE_MIN_TIME", "300"))
         progress_gate = WindowProgressGate(
-            window=4,
-            patience_windows=2,
-            epsilon=0.0010,
-            min_time=min(300.0, max(0.0, float(budget))),
+            window=gate_window,
+            patience_windows=gate_patience,
+            epsilon=gate_epsilon,
+            min_time=min(gate_min_time, max(0.0, float(budget))),
             initial_best=best_proxy,
+        )
+        print(
+            f"Soft displace gate: window={gate_window} patience={gate_patience} "
+            f"epsilon={gate_epsilon:.4f} min_time={min(gate_min_time, max(0.0, float(budget))):.0f}s"
         )
 
         def rebuild_fast_state(from_tensor):

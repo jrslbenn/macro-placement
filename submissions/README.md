@@ -1,4 +1,4 @@
-# SPIRAL Placer — James Bennett
+# HAPpyPlace — James Bennett
 
 ## Run
 

@@ -49,6 +49,8 @@ def main():
         os.environ["HAP_LOG_DIR"] = args.log_dir
     if args.vis_dir:
         os.environ["HAP_VIS_DIR"] = args.vis_dir
+    os.environ.setdefault("HAP_TOTAL_TIME_BUDGET", "2850")
+    os.environ.setdefault("HAP_HARD_TIME_BUDGET", "2850")
 
     from macro_place.loader import load_benchmark_from_dir
     from macro_place.objective import compute_proxy_cost

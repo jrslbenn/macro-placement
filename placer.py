@@ -1,5 +1,5 @@
 """
-Canonical entry point for the HAPpy Placer submission.
+Canonical entry point for the HAPpyPlace submission.
 
 The competition eval expects a `Placer` class with a `place(benchmark)` method.
 This thin shim re-exports the full pipeline implemented in
@@ -48,16 +48,17 @@ if _env_enabled("HAP_MULTI", "1"):
     HybridAnalyticalPlacerV2Multi = _multi_mod.HybridAnalyticalPlacerV2Multi
 
     class Placer(HybridAnalyticalPlacerV2Multi):
-        """HAPpy Placer multi-start wrapper; set HAP_MULTI=0 to disable."""
+        """HAPpyPlace multi-start wrapper; set HAP_MULTI=0 to disable."""
 
         def __init__(self):
             super().__init__(
                 num_steps=int(os.environ.get("HAP_MULTI_NUM_STEPS", "50000")),
                 threads_per_worker=int(os.environ.get("HAP_MULTI_THREADS", "3")),
+                enable_plots=_env_enabled("HAP_ENABLE_PLOTS", "0"),
             )
 
 else:
 
     class Placer(HybridAnalyticalPlacerV2):
-        """HAPpy Placer — pipeline detailed in README.md."""
+        """HAPpyPlace — pipeline detailed in README.md."""
         pass

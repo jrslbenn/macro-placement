@@ -111,7 +111,7 @@ class HybridAnalyticalPlacerV2Multi:
         seed: int = 42,
         num_steps: int = 50000,
         verbose: bool = True,
-        enable_plots: bool = True,
+        enable_plots: bool = False,
         workers: List[Dict[str, Any]] | None = None,
         threads_per_worker: int = 3,
     ):

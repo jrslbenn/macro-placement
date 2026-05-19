@@ -4,6 +4,40 @@
 
 **Win $20,000 by developing better macro placement algorithms!**
 
+---
+
+## For Judges — HAPpyPlace Submission (James Bennett / jrslbenn)
+
+**Build:**
+```bash
+git submodule update --init external/MacroPlacement
+docker build -t happyplace .
+```
+
+**Run all 17 IBM benchmarks** (this is the intended invocation):
+```bash
+docker run --rm --network none --gpus all happyplace
+```
+
+**Run a single benchmark:**
+```bash
+docker run --rm --network none --gpus all happyplace -b ibm01
+```
+
+The `ENTRYPOINT` is `python -m macro_place.evaluate /app/placer.py`, with default `CMD ["--all"]`. Any args you pass after the image name override `CMD` and are forwarded to the evaluator (e.g., `-b ibm03`, `--ng45`).
+
+**Expected output:** stdout shows per-benchmark proxy costs ending with a line like:
+```
+proxy=0.9377  (wl=0.063 den=0.502 cong=1.248)  VALID  [1966.08s]
+```
+The `[multi] WINNER:` line above also reports the chosen worker and its score.
+
+**Approximate runtime:** 24-53 min/benchmark depending on size (well under the 1hr/bench cap), ~10h total for `--all` on a 16-core x86 host. Each benchmark spawns 4 parallel workers internally; the wrapper waits for all four and picks the best result.
+
+**CPU/GPU:** code is CPU-only; `--gpus all` is harmless but not required. Container env vars set sensible thread counts (`OMP/MKL/NUMBA_NUM_THREADS=3` × 4 workers = 12 threads, leaving headroom on a 16-core cap).
+
+---
+
 Partcl and Hudson River Trading are excited to co-host a competition to solve the macro placement problem. 
 
 ## About Macro Placement

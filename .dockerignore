@@ -1,4 +1,4 @@
-# Docker build context exclusions for eval_docker/
+# Docker build context exclusions
 .git/
 .DS_Store
 .pytest_cache/
@@ -6,10 +6,15 @@
 .venv/
 __pycache__/
 **/__pycache__/
+*.egg-info/
+
+# Submission infra not needed at runtime
 submissions_eval/
 assets/
 benchmarks/processed/
 eval_docker/results/
+
+# Experiment outputs (everything we want NOT shipped to judges)
 ab_logs/
 ab_vis/
 logs/
@@ -22,6 +27,22 @@ saved_logs/
 sweep_1_11_logs/
 sweep_1_11_vis/
 vis/
+final_multi_runs/
+final_pair_runs/
+final_pair_stdout/
+final_sweep_logs/
+final_sweep_vis/
+results/
+
+# Unused submodule subdirs (Dockerfile explicitly COPYs the two we need)
+external/MacroPlacement/Flows/
+external/MacroPlacement/Docs/
+external/MacroPlacement/Enablements/
+external/MacroPlacement/ExperimentalData/
+external/MacroPlacement/CodeElements/*
+!external/MacroPlacement/CodeElements/Plc_client
+
+# Logs and visuals
 *.log
 *.gif
 *.png
