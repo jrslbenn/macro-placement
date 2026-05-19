@@ -23,6 +23,7 @@ import pickle
 import subprocess
 import sys
 import time
+import importlib.util
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -90,7 +91,10 @@ def worker_variants_from_env() -> List[Dict[str, Any]]:
     if explicit:
         labels = [x.strip() for x in explicit.split(",") if x.strip()]
     else:
-        labels = WORKER_SETS.get(os.environ.get("HAP_MULTI_SET", "four").strip(), WORKER_SETS["four"])
+        labels = WORKER_SETS.get(
+            os.environ.get("HAP_MULTI_SET", "provided4").strip(),
+            WORKER_SETS["provided4"],
+        )
     workers = []
     for label in labels:
         if label not in label_to_worker:
@@ -137,7 +141,12 @@ class HybridAnalyticalPlacerV2Multi:
                     f"[multi] reload dir missing for '{benchmark.name}' "
                     f"({bench_dir}); falling back to single run"
                 )
-            from submissions.hybridv2 import HybridAnalyticalPlacerV2
+            spec = importlib.util.spec_from_file_location(
+                "_hv2_single_fallback", str(Path(__file__).resolve().parent / "hybridv2.py")
+            )
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            HybridAnalyticalPlacerV2 = mod.HybridAnalyticalPlacerV2
 
             placer = HybridAnalyticalPlacerV2(
                 seed=self.seed,

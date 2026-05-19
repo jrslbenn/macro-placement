@@ -11,11 +11,16 @@ Run via:
 
 import importlib.util
 import os
+import sys
+
+_ROOT = os.path.dirname(os.path.abspath(__file__))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
 
 # Load the implementation file by path (the eval harness loads this `placer.py`
 # standalone, so `from submissions.hybridv2 import ...` doesn't resolve).
 _HV2_PATH = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
+    _ROOT,
     "submissions",
     "hybridv2.py",
 )
@@ -26,13 +31,13 @@ _spec.loader.exec_module(_mod)
 HybridAnalyticalPlacerV2 = _mod.HybridAnalyticalPlacerV2
 
 
-def _env_enabled(name: str) -> bool:
-    return os.environ.get(name, "").strip().lower() not in ("", "0", "false", "no", "off")
+def _env_enabled(name: str, default: str = "") -> bool:
+    return os.environ.get(name, default).strip().lower() not in ("", "0", "false", "no", "off")
 
 
-if _env_enabled("HAP_MULTI"):
+if _env_enabled("HAP_MULTI", "1"):
     _MULTI_PATH = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)),
+        _ROOT,
         "submissions",
         "hybridv2_multi.py",
     )
@@ -43,7 +48,7 @@ if _env_enabled("HAP_MULTI"):
     HybridAnalyticalPlacerV2Multi = _multi_mod.HybridAnalyticalPlacerV2Multi
 
     class Placer(HybridAnalyticalPlacerV2Multi):
-        """HAPpy Placer multi-start wrapper, enabled by HAP_MULTI=1."""
+        """HAPpy Placer multi-start wrapper; set HAP_MULTI=0 to disable."""
 
         def __init__(self):
             super().__init__(
