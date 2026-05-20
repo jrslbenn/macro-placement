@@ -24,6 +24,13 @@ docker run --rm --network none --gpus all happyplace
 docker run --rm --network none --gpus all happyplace -b ibm01
 ```
 
+**Run NG45 designs (Tier 2 input):**
+```bash
+docker run --rm --network none --gpus all happyplace --ng45              # all 4 public designs
+docker run --rm --network none --gpus all happyplace --ng45 -b ariane133 # single design
+```
+The 4 public NG45 designs (ariane133, ariane136, mempool_tile, nvdla) are baked into the image at their TILOS submodule paths. Hidden designs mounted at `external/MacroPlacement/Flows/NanGate45/<name>/netlist/output_CT_Grouping/` would also be picked up.
+
 The `ENTRYPOINT` is `python -m macro_place.evaluate /app/placer.py`, with default `CMD ["--all"]`. Any args you pass after the image name override `CMD` and are forwarded to the evaluator (e.g., `-b ibm03`, `--ng45`).
 
 **Expected output:** stdout shows per-benchmark proxy costs ending with a line like:
