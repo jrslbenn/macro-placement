@@ -130,16 +130,12 @@ class HybridAnalyticalPlacerV2Multi:
         # Workers reload from the public benchmark directory for the current
         # Tier-1 (IBM) or Tier-2 (NG45) benchmark name.
         repo_root = Path(__file__).resolve().parent.parent
-        NG45_PATHS = {
-            "ariane133": "Flows/NanGate45/ariane133/netlist/output_CT_Grouping",
-            "ariane136": "Flows/NanGate45/ariane136/netlist/output_CT_Grouping",
-            "mempool_tile": "Flows/NanGate45/mempool_tile/netlist/output_CT_Grouping",
-            "nvdla": "Flows/NanGate45/nvdla/netlist/output_CT_Grouping",
-        }
-        if benchmark.name in NG45_PATHS:
-            bench_dir = repo_root / "external" / "MacroPlacement" / NG45_PATHS[benchmark.name]
-        else:
-            bench_dir = repo_root / "external" / "MacroPlacement" / "Testcases" / "ICCAD04" / benchmark.name
+        # Try common locations: IBM testcase root or NG45 flow root.
+        candidate_paths = [
+            repo_root / "external" / "MacroPlacement" / "Testcases" / "ICCAD04" / benchmark.name,
+            repo_root / "external" / "MacroPlacement" / "Flows" / "NanGate45" / benchmark.name / "netlist" / "output_CT_Grouping",
+        ]
+        bench_dir = next((p for p in candidate_paths if p.exists()), candidate_paths[0])
         if not bench_dir.exists():
             # The forked workers need a benchmark directory so they can reload
             # the plc object. For benchmarks that are handed to us only as an
