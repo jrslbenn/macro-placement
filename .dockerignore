@@ -34,8 +34,25 @@ final_sweep_logs/
 final_sweep_vis/
 results/
 
-# Unused submodule subdirs (Dockerfile explicitly COPYs the two we need)
+# Unused submodule subdirs (Dockerfile explicitly COPYs the parts we need)
 external/MacroPlacement/Flows/
+!external/MacroPlacement/Flows/NanGate45
+!external/MacroPlacement/Flows/NanGate45/ariane133
+!external/MacroPlacement/Flows/NanGate45/ariane133/netlist
+!external/MacroPlacement/Flows/NanGate45/ariane133/netlist/output_CT_Grouping
+!external/MacroPlacement/Flows/NanGate45/ariane133/netlist/output_CT_Grouping/**
+!external/MacroPlacement/Flows/NanGate45/ariane136
+!external/MacroPlacement/Flows/NanGate45/ariane136/netlist
+!external/MacroPlacement/Flows/NanGate45/ariane136/netlist/output_CT_Grouping
+!external/MacroPlacement/Flows/NanGate45/ariane136/netlist/output_CT_Grouping/**
+!external/MacroPlacement/Flows/NanGate45/mempool_tile
+!external/MacroPlacement/Flows/NanGate45/mempool_tile/netlist
+!external/MacroPlacement/Flows/NanGate45/mempool_tile/netlist/output_CT_Grouping
+!external/MacroPlacement/Flows/NanGate45/mempool_tile/netlist/output_CT_Grouping/**
+!external/MacroPlacement/Flows/NanGate45/nvdla
+!external/MacroPlacement/Flows/NanGate45/nvdla/netlist
+!external/MacroPlacement/Flows/NanGate45/nvdla/netlist/output_CT_Grouping
+!external/MacroPlacement/Flows/NanGate45/nvdla/netlist/output_CT_Grouping/**
 external/MacroPlacement/Docs/
 external/MacroPlacement/Enablements/
 external/MacroPlacement/ExperimentalData/

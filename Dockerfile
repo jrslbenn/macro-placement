@@ -19,6 +19,18 @@ WORKDIR /app
 COPY external/MacroPlacement/Testcases/ICCAD04/ /app/external/MacroPlacement/Testcases/ICCAD04/
 COPY external/MacroPlacement/CodeElements/Plc_client/ /app/external/MacroPlacement/CodeElements/Plc_client/
 
+# NG45 design files needed for `--ng45` evaluation (placer only reads
+# netlist.pb.txt + initial.plc from output_CT_Grouping/; rest of each
+# design package is omitted to keep the image small).
+COPY external/MacroPlacement/Flows/NanGate45/ariane133/netlist/output_CT_Grouping/ \
+     /app/external/MacroPlacement/Flows/NanGate45/ariane133/netlist/output_CT_Grouping/
+COPY external/MacroPlacement/Flows/NanGate45/ariane136/netlist/output_CT_Grouping/ \
+     /app/external/MacroPlacement/Flows/NanGate45/ariane136/netlist/output_CT_Grouping/
+COPY external/MacroPlacement/Flows/NanGate45/mempool_tile/netlist/output_CT_Grouping/ \
+     /app/external/MacroPlacement/Flows/NanGate45/mempool_tile/netlist/output_CT_Grouping/
+COPY external/MacroPlacement/Flows/NanGate45/nvdla/netlist/output_CT_Grouping/ \
+     /app/external/MacroPlacement/Flows/NanGate45/nvdla/netlist/output_CT_Grouping/
+
 COPY . .
 RUN pip install --no-cache-dir -e .
 
