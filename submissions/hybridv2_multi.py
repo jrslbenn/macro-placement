@@ -128,9 +128,18 @@ class HybridAnalyticalPlacerV2Multi:
         # Benchmark dataclass — the worker reloads via load_benchmark_from_dir
         # using a known root + benchmark name.
         # Workers reload from the public benchmark directory for the current
-        # Tier-1 benchmark name.
+        # Tier-1 (IBM) or Tier-2 (NG45) benchmark name.
         repo_root = Path(__file__).resolve().parent.parent
-        bench_dir = repo_root / "external" / "MacroPlacement" / "Testcases" / "ICCAD04" / benchmark.name
+        NG45_PATHS = {
+            "ariane133": "Flows/NanGate45/ariane133/netlist/output_CT_Grouping",
+            "ariane136": "Flows/NanGate45/ariane136/netlist/output_CT_Grouping",
+            "mempool_tile": "Flows/NanGate45/mempool_tile/netlist/output_CT_Grouping",
+            "nvdla": "Flows/NanGate45/nvdla/netlist/output_CT_Grouping",
+        }
+        if benchmark.name in NG45_PATHS:
+            bench_dir = repo_root / "external" / "MacroPlacement" / NG45_PATHS[benchmark.name]
+        else:
+            bench_dir = repo_root / "external" / "MacroPlacement" / "Testcases" / "ICCAD04" / benchmark.name
         if not bench_dir.exists():
             # The forked workers need a benchmark directory so they can reload
             # the plc object. For benchmarks that are handed to us only as an
