@@ -9,6 +9,7 @@ Design goals:
 
 import math
 import cProfile
+import pickle
 import pstats
 import io
 import random
@@ -1920,6 +1921,43 @@ class HybridAnalyticalPlacer:
                 else:
                     print("Soft displace skipped: no remaining budget")
 
+                # Mid-pipeline emergency checkpoint: if we're already
+                # >80% through the hard time budget when Soft displace
+                # ends, write a pkl with the current best so that a
+                # SIGTERM during the remaining stages (Soft CD / Hard
+                # displace / Tail / final logging) still leaves a
+                # usable result on disk.
+                elapsed_after_soft_disp = time() - start_time
+                if (
+                    elapsed_after_soft_disp > 0.80 * hard_time_budget
+                    and plc is not None
+                ):
+                    out_path_mid = getattr(self, "_out_path", None)
+                    if out_path_mid:
+                        try:
+                            mid_metrics = compute_proxy_cost(
+                                best_valid_placement, benchmark, plc
+                            )
+                            mid_out = {
+                                "placement": best_valid_placement.detach().cpu(),
+                                "proxy": float(mid_metrics["proxy_cost"]),
+                                "wl": float(mid_metrics["wirelength_cost"]),
+                                "den": float(mid_metrics["density_cost"]),
+                                "cong": float(mid_metrics["congestion_cost"]),
+                                "overlap_count": int(mid_metrics["overlap_count"]),
+                            }
+                            tmp = str(out_path_mid) + ".tmp"
+                            with open(tmp, "wb") as f:
+                                pickle.dump(mid_out, f)
+                            os.replace(tmp, out_path_mid)
+                            print(
+                                f"[checkpoint] mid-pipeline pkl written "
+                                f"(elapsed={elapsed_after_soft_disp:.0f}s, "
+                                f"proxy={mid_out['proxy']:.4f})"
+                            )
+                        except Exception as exc:
+                            print(f"[warn] mid checkpoint write failed: {exc}")
+
                 if self.enable_soft_cd:
                     remaining = total_time_budget - (time() - start_time)
                     soft_cd_budget = stage_budget("Soft CD", max_budget=soft_cd_max_budget)
@@ -2223,7 +2261,35 @@ class HybridAnalyticalPlacer:
             print("WARNING: final has overlaps, emergency legalize")
             final = strong_legalize(final, benchmark, gap=0.05, max_iters=200)
 
-        self._log_stats("final", benchmark, final, plc, wl=None, density_weight=density_weight)
+        # Compute metrics once. We were going to compute them inside
+        # _log_stats anyway; doing it here lets us write the worker pkl
+        # BEFORE the final log step, so a SIGTERM during _log_stats or
+        # after _place_impl returns still leaves a valid pkl behind.
+        final_metrics = None
+        if plc is not None:
+            final_metrics = compute_proxy_cost(final, benchmark, plc)
+            out_path = getattr(self, "_out_path", None)
+            if out_path:
+                try:
+                    out = {
+                        "placement": final.detach().cpu(),
+                        "proxy": float(final_metrics["proxy_cost"]),
+                        "wl": float(final_metrics["wirelength_cost"]),
+                        "den": float(final_metrics["density_cost"]),
+                        "cong": float(final_metrics["congestion_cost"]),
+                        "overlap_count": int(final_metrics["overlap_count"]),
+                    }
+                    tmp = str(out_path) + ".tmp"
+                    with open(tmp, "wb") as f:
+                        pickle.dump(out, f)
+                    os.replace(tmp, out_path)
+                except Exception as exc:
+                    print(f"[warn] early pkl write failed: {exc}")
+
+        self._log_stats(
+            "final", benchmark, final, plc,
+            wl=None, density_weight=density_weight, metrics=final_metrics,
+        )
         # pr.disable()
         # s = io.StringIO()
         # pstats.Stats(pr, stream=s).sort_stats('cumulative').print_stats(20)

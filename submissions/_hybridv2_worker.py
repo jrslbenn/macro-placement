@@ -78,16 +78,35 @@ def main():
         init_jitter_sigma=args.init_jitter_sigma,
     )
 
-    placement = placer.place(benchmark)
-    metrics = compute_proxy_cost(placement, benchmark, plc)
+    # Tell the placer where to write its early pkl. If it succeeds, we
+    # reuse those metrics; if it doesn't (e.g., write failed), we fall
+    # back to computing here.
+    placer._out_path = args.out_path
 
-    out = {
-        "placement": placement.detach().cpu(),
-        "proxy": float(metrics["proxy_cost"]),
-        "wl": float(metrics["wirelength_cost"]),
-        "den": float(metrics["density_cost"]),
-        "cong": float(metrics["congestion_cost"]),
-        "overlap_count": int(metrics["overlap_count"]),
+    placement = placer.place(benchmark)
+
+    out = None
+    if os.path.exists(args.out_path):
+        try:
+            with open(args.out_path, "rb") as f:
+                out = pickle.load(f)
+        except Exception:
+            out = None
+
+    if out is None:
+        # Placer didn't write a pkl — compute proxy ourselves as fallback.
+        metrics = compute_proxy_cost(placement, benchmark, plc)
+        out = {
+            "placement": placement.detach().cpu(),
+            "proxy": float(metrics["proxy_cost"]),
+            "wl": float(metrics["wirelength_cost"]),
+            "den": float(metrics["density_cost"]),
+            "cong": float(metrics["congestion_cost"]),
+            "overlap_count": int(metrics["overlap_count"]),
+        }
+
+    # Add init metadata (placer doesn't know these), then re-pickle.
+    out.update({
         "strategy": args.init_strategy,
         "seed": args.seed,
         "init_perturb_sigma": args.init_perturb_sigma,
@@ -95,9 +114,11 @@ def main():
         "init_spectral_flip_x": bool(args.init_spectral_flip_x),
         "init_spectral_flip_y": bool(args.init_spectral_flip_y),
         "init_jitter_sigma": args.init_jitter_sigma,
-    }
-    with open(args.out_path, "wb") as f:
+    })
+    tmp = args.out_path + ".tmp"
+    with open(tmp, "wb") as f:
         pickle.dump(out, f)
+    os.replace(tmp, args.out_path)
 
     print(
         f"[worker] done: proxy={out['proxy']:.6f} "
