@@ -213,7 +213,7 @@ class HybridAnalyticalPlacerV2Multi:
         if self.verbose:
             print(f"[multi] waiting for {len(procs)} workers...", flush=True)
         start_t = time.time()
-        worker_timeout = float(os.environ.get("HAP_MULTI_WORKER_TIMEOUT", "3200"))
+        worker_timeout = float(os.environ.get("HAP_MULTI_WORKER_TIMEOUT", "3500"))
         for label, p, log_f, log_path in procs:
             remaining_timeout = max(1.0, worker_timeout - (time.time() - start_t))
             try:
